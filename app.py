@@ -1,3 +1,4 @@
+# Bibliotecas usadas pela aplicação. A maior parte da interface é feita com Streamlit.
 import streamlit as st
 import sqlite3, hashlib, secrets, io, base64, hmac, shutil, os
 from pathlib import Path
@@ -60,6 +61,7 @@ div[data-testid="stForm"] { background:#fff; border:1px solid #d9e5ef; border-ra
 
 </style>
 """, unsafe_allow_html=True)
+# Caminhos usados pelo sistema. Os dados ficam fora do código para facilitar backup e implantação.
 BASE = Path(__file__).parent
 DATA_DIR = BASE/'data'
 DB = DATA_DIR/'avaliacao.db'
@@ -75,6 +77,7 @@ LOGIN_IMAGE = BASE/'assets'/'ufrr_foto_login_v24.jpg'
 PDF_DIR.mkdir(exist_ok=True)
 SIGN_DIR.mkdir(parents=True, exist_ok=True)
 
+# Critérios e pesos usados no cálculo da nota final.
 CRITERIOS = [
  ('Relevância do tema', .20),
  ('Clareza e adequação dos objetivos', .15),
