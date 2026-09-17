@@ -1,4 +1,4 @@
-# Plataforma de Avaliação de Resumos Científicos — UFRR
+# Plataforma de Avaliação de Resumos Científicos - UFRR
 
 Plataforma web independente para apoiar a avaliação, distribuição, consolidação e documentação de resumos científicos em eventos acadêmicos.
 
@@ -152,15 +152,15 @@ Para uma implantação pública, recomenda-se colocar um reverse proxy com HTTPS
 
 ## Documentação
 
-- `docs/01_visao_geral.md` — visão geral e fluxo da plataforma;
-- `docs/02_manual_coordenacao.md` — recursos da coordenação;
-- `docs/03_manual_avaliador.md` — recursos do avaliador;
-- `docs/04_manual_tecnico_implantacao.md` — implantação e operação técnica;
-- `docs/05_requisitos_para_implantacao.md` — requisitos de infraestrutura;
-- `docs/06_checklist_entrega.md` — checklist de implantação;
-- `docs/07_funcionalidades_v29.md` — funcionalidades da versão;
-- `docs/BACKUP_RESTAURACAO_DOCKER.md` — backup e restauração;
-- `docs/SEGURANCA_IMPLANTACAO.md` — controles e responsabilidades de segurança.
+- `docs/01_visao_geral.md` - visão geral e fluxo da plataforma;
+- `docs/02_manual_coordenacao.md` - recursos da coordenação;
+- `docs/03_manual_avaliador.md` - recursos do avaliador;
+- `docs/04_manual_tecnico_implantacao.md` - implantação e operação técnica;
+- `docs/05_requisitos_para_implantacao.md` - requisitos de infraestrutura;
+- `docs/06_checklist_entrega.md` - checklist de implantação;
+- `docs/07_funcionalidades_v29.md` - funcionalidades da versão;
+- `docs/BACKUP_RESTAURACAO_DOCKER.md` - backup e restauração;
+- `docs/SEGURANCA_IMPLANTACAO.md` - controles e responsabilidades de segurança.
 
 ## Domínio e DNS
 
