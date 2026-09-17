@@ -168,7 +168,7 @@ O código não fixa domínio, endereço IP ou hostname de produção. Em uma imp
 
 ## Segurança
 
-Consulte `SECURITY.md` e `docs/SEGURANCA_IMPLANTACAO.md`.
+Consulte `docs/SEGURANCA_IMPLANTACAO.md`.
 
 O código utiliza autenticação local, controle de acesso por perfil, hashing PBKDF2-HMAC-SHA256 para novas senhas, consultas parametrizadas, auditoria administrativa e controles adicionais no container. Esses mecanismos não equivalem a uma auditoria de segurança, pentest ou homologação institucional.
 
