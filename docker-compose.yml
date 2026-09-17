@@ -1,0 +1,23 @@
+services:
+  avaliacao-ufrr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: avaliacao-ufrr
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./resumos:/app/resumos
+      - ./backups:/app/backups
+      - ./assets/assinaturas:/app/assets/assinaturas
+    env_file:
+      - .env
+    environment:
+      TZ: America/Boa_Vista
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
