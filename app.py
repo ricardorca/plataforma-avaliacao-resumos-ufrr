@@ -273,6 +273,23 @@ def init_db():
         raise last
 
 
+def now():
+    """Retorna data e hora atual no formato usado pela plataforma."""
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def log(user, action):
+    """Registra uma ação na tabela de auditoria."""
+    q(
+        'INSERT INTO auditoria(usuario,acao,quando) VALUES(?,?,?)',
+        (user, action, now())
+    )
+
+
+def q(sql,args=(),many=False):
+    """Executa uma consulta PostgreSQL e retorna linhas SELECT como dicts."""
+    c = conn()
+
 def q(sql,args=(),many=False):
     """Executa uma consulta PostgreSQL e retorna linhas SELECT como dicts."""
     c = conn()
