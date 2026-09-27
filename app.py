@@ -1,12 +1,13 @@
 # Bibliotecas usadas pela aplicação. A maior parte da interface é feita com Streamlit.
 import streamlit as st
-import hashlib, secrets, io, base64, hmac, shutil, os
-import psycopg
+import hashlib, secrets, io, base64, hmac, shutil, os, re, json, zipfile
 from pathlib import Path
 from datetime import datetime
 import unicodedata
 import pandas as pd
 import streamlit.components.v1 as components
+import psycopg
+from psycopg.rows import dict_row
 
 st.set_page_config(page_title='Avaliação de Resumos - UFRR', page_icon='🎓', layout='wide')
 
@@ -65,18 +66,14 @@ div[data-testid="stForm"] { background:#fff; border:1px solid #d9e5ef; border-ra
 # Caminhos usados pelo sistema. Os dados ficam fora do código para facilitar backup e implantação.
 BASE = Path(__file__).parent
 DATA_DIR = BASE/'data'
-DB = DATA_DIR/'avaliacao.db'
-PDF_DIR = BASE/'resumos'
-BACKUP_DIR = BASE/'backups'
-SIGN_DIR = BASE/'assets'/'assinaturas'
+DB = None  # Os dados persistentes ficam no PostgreSQL/Supabase.
+BACKUP_DIR = BASE/'backups'  # apenas para compatibilidade; backups são gerados para download
 TEMPLATE_BASE = BASE/'assets'/'certificado.pdf'
 TEMPLATE_PREMIO = TEMPLATE_BASE
 TEMPLATE_PARTICIPACAO = TEMPLATE_BASE
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOGO = BASE/'assets'/'brasao_ufrr.png'
 LOGIN_IMAGE = BASE/'assets'/'ufrr_foto_login_v24.jpg'
-PDF_DIR.mkdir(exist_ok=True)
-SIGN_DIR.mkdir(parents=True, exist_ok=True)
 
 # Critérios e pesos usados no cálculo da nota final.
 CRITERIOS = [
@@ -88,258 +85,198 @@ CRITERIOS = [
 ]
 RECOMENDACOES = ['Aprovado sem correção', 'Aprovado com correção', 'Não aprovado']
 
-def conn():
-    """Abre uma conexão com o PostgreSQL do Supabase."""
-    database_url = os.getenv('DATABASE_URL', '').strip()
-
-    if not database_url:
-        raise RuntimeError(
-            'DATABASE_URL não configurada nos Secrets do Streamlit.'
-        )
-
-    return psycopg.connect(database_url)
-    c.row_factory=sqlite3.Row
+def _secret(name, default=''):
+    """Lê um segredo do Streamlit Cloud e, como fallback, do ambiente."""
     try:
-        c.execute('PRAGMA journal_mode=WAL')
-        c.execute('PRAGMA busy_timeout=30000')
-        c.execute('PRAGMA foreign_keys=ON')
-        c.execute('PRAGMA synchronous=NORMAL')
-    except sqlite3.Error:
-        pass
-    return c
+        value = st.secrets.get(name, default)
+    except Exception:
+        value = os.getenv(name, default)
+    return str(value).strip() if value is not None else default
 
-def pw(s):
-    """Hash seguro para novas senhas. Mantém formato identificável para migração."""
-    iterations = 240000
-    salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac('sha256', s.encode('utf-8'), salt, iterations)
-    return f"pbkdf2_sha256${iterations}${salt.hex()}${digest.hex()}"
 
-def verify_password(password, stored):
-    """Valida PBKDF2 e também aceita hashes SHA-256 antigos para migração."""
-    if not stored:
-        return False
-    if stored.startswith('pbkdf2_sha256$'):
-        try:
-            _, iterations, salt_hex, digest_hex = stored.split('$', 3)
-            calc = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), bytes.fromhex(salt_hex), int(iterations))
-            return hmac.compare_digest(calc.hex(), digest_hex)
-        except Exception:
-            return False
-    return hmac.compare_digest(stored, hashlib.sha256(password.encode('utf-8')).hexdigest())
+def _database_url():
+    url = _secret('DATABASE_URL', '')
+    if not url:
+        raise RuntimeError('DATABASE_URL não configurada nos Secrets do Streamlit.')
+    return url
 
-def now(): return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-def _init_db_once():
-
-    master_email = os.getenv(
-        'MASTER_EMAIL',
-        'admin@example.local'
-    ).strip().lower()
-
-    master_name = os.getenv(
-        'MASTER_NAME',
-        'Administrador local'
-    ).strip()
-
-    master_password = os.getenv(
-        'MASTER_INITIAL_PASSWORD',
-        ''
+def conn():
+    """Abre uma conexão PostgreSQL persistente no Supabase."""
+    return psycopg.connect(
+        _database_url(),
+        row_factory=dict_row,
+        connect_timeout=20,
     )
 
-    if not master_password:
-        raise RuntimeError(
-            'MASTER_INITIAL_PASSWORD não configurada nos Secrets.'
+
+def _adapt_sql(sql):
+    """Converte SQL legado do PostgreSQL para PostgreSQL.
+
+    A aplicação original usava '?' como placeholder e alguns INSERT OR IGNORE.
+    Centralizar essa conversão evita alterar centenas de consultas individualmente.
+    """
+    sql = str(sql)
+    sql = sql.replace('?', '%s')
+    if re.search(r'INSERT\s+OR\s+IGNORE\s+INTO', sql, flags=re.I):
+        sql = re.sub(r'INSERT\s+OR\s+IGNORE\s+INTO', 'INSERT INTO', sql, flags=re.I)
+        if not re.search(r'\bON\s+CONFLICT\b', sql, flags=re.I):
+            sql = sql.rstrip().rstrip(';') + ' ON CONFLICT DO NOTHING'
+    return sql
+
+
+def _init_db_once():
+    c = conn()
+    try:
+        cur = c.cursor()
+        statements = [
+            """CREATE TABLE IF NOT EXISTS users(
+                id BIGSERIAL PRIMARY KEY,
+                email TEXT UNIQUE,
+                nome TEXT,
+                perfil TEXT,
+                senha TEXT,
+                ativo INTEGER DEFAULT 1,
+                tipo_autenticacao TEXT DEFAULT 'local',
+                deve_trocar_senha INTEGER DEFAULT 0
+            )""",
+            """CREATE TABLE IF NOT EXISTS trabalhos(
+                id BIGSERIAL PRIMARY KEY,
+                codigo TEXT UNIQUE,
+                nomes TEXT,
+                area TEXT,
+                titulo TEXT,
+                resumo TEXT,
+                arquivo TEXT,
+                arquivo_dados BYTEA,
+                criado_em TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS atribuicoes(
+                id BIGSERIAL PRIMARY KEY,
+                trabalho_id BIGINT,
+                avaliador_id BIGINT,
+                tipo TEXT DEFAULT 'principal',
+                UNIQUE(trabalho_id,avaliador_id,tipo)
+            )""",
+            """CREATE TABLE IF NOT EXISTS avaliacoes(
+                id BIGSERIAL PRIMARY KEY,
+                trabalho_id BIGINT,
+                avaliador_id BIGINT,
+                tipo TEXT DEFAULT 'principal',
+                n1 REAL,n2 REAL,n3 REAL,n4 REAL,n5 REAL,
+                nota REAL,
+                comentario TEXT,
+                recomendacao TEXT,
+                enviada_em TEXT,
+                UNIQUE(trabalho_id,avaliador_id,tipo)
+            )""",
+            """CREATE TABLE IF NOT EXISTS auditoria(
+                id BIGSERIAL PRIMARY KEY,
+                usuario TEXT,
+                acao TEXT,
+                quando TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS certificado_config(
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                prof1_nome TEXT DEFAULT '', prof1_cargo TEXT DEFAULT '', prof1_assinatura TEXT DEFAULT '', prof1_assinatura_dados BYTEA,
+                prof2_nome TEXT DEFAULT '', prof2_cargo TEXT DEFAULT '', prof2_assinatura TEXT DEFAULT '', prof2_assinatura_dados BYTEA,
+                prof3_nome TEXT DEFAULT '', prof3_cargo TEXT DEFAULT '', prof3_assinatura TEXT DEFAULT '', prof3_assinatura_dados BYTEA,
+                prof4_nome TEXT DEFAULT '', prof4_cargo TEXT DEFAULT '', prof4_assinatura TEXT DEFAULT '', prof4_assinatura_dados BYTEA,
+                data_inicio TEXT DEFAULT '', data_fim TEXT DEFAULT '', local TEXT DEFAULT 'Boa Vista/RR'
+            )""",
+        ]
+        for statement in statements:
+            cur.execute(statement)
+
+        # Migrações idempotentes para bancos que eventualmente já existam.
+        migrations = [
+            "ALTER TABLE trabalhos ADD COLUMN IF NOT EXISTS nomes TEXT DEFAULT ''",
+            "ALTER TABLE trabalhos ADD COLUMN IF NOT EXISTS arquivo_dados BYTEA",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS tipo_autenticacao TEXT DEFAULT 'local'",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS deve_trocar_senha INTEGER DEFAULT 0",
+            "ALTER TABLE avaliacoes ADD COLUMN IF NOT EXISTS recomendacao TEXT",
+            "ALTER TABLE certificado_config ADD COLUMN IF NOT EXISTS prof1_assinatura_dados BYTEA",
+            "ALTER TABLE certificado_config ADD COLUMN IF NOT EXISTS prof2_assinatura_dados BYTEA",
+            "ALTER TABLE certificado_config ADD COLUMN IF NOT EXISTS prof3_assinatura_dados BYTEA",
+            "ALTER TABLE certificado_config ADD COLUMN IF NOT EXISTS prof4_assinatura_dados BYTEA",
+        ]
+        for statement in migrations:
+            cur.execute(statement)
+
+        master_email = _secret('MASTER_EMAIL', 'admin@example.local').lower()
+        master_name = _secret('MASTER_NAME', 'Administrador local')
+        master_password = _secret('MASTER_INITIAL_PASSWORD', '')
+        if not master_password:
+            raise RuntimeError('MASTER_INITIAL_PASSWORD não configurada nos Secrets do Streamlit.')
+
+        cur.execute(
+            """INSERT INTO users(email,nome,perfil,senha,tipo_autenticacao,deve_trocar_senha)
+               VALUES(%s,%s,%s,%s,%s,0)
+               ON CONFLICT(email) DO NOTHING""",
+            (master_email, master_name, 'master', pw(master_password), 'local')
         )
-
-    with conn() as c:
-        with c.cursor() as cur:
-
-            # USUÁRIOS
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id BIGSERIAL PRIMARY KEY,
-                    email TEXT UNIQUE,
-                    nome TEXT,
-                    perfil TEXT,
-                    senha TEXT,
-                    ativo INTEGER DEFAULT 1,
-                    tipo_autenticacao TEXT DEFAULT 'local',
-                    deve_trocar_senha INTEGER DEFAULT 0
-                )
-            """)
-
-            # TRABALHOS
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS trabalhos (
-                    id BIGSERIAL PRIMARY KEY,
-                    codigo TEXT UNIQUE,
-                    nomes TEXT,
-                    area TEXT,
-                    titulo TEXT,
-                    resumo TEXT,
-                    arquivo TEXT,
-                    criado_em TEXT
-                )
-            """)
-
-            # ATRIBUIÇÕES
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS atribuicoes (
-                    id BIGSERIAL PRIMARY KEY,
-                    trabalho_id BIGINT,
-                    avaliador_id BIGINT,
-                    tipo TEXT DEFAULT 'principal',
-
-                    UNIQUE(
-                        trabalho_id,
-                        avaliador_id,
-                        tipo
-                    )
-                )
-            """)
-
-            # AVALIAÇÕES
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS avaliacoes (
-                    id BIGSERIAL PRIMARY KEY,
-                    trabalho_id BIGINT,
-                    avaliador_id BIGINT,
-                    tipo TEXT DEFAULT 'principal',
-
-                    n1 DOUBLE PRECISION,
-                    n2 DOUBLE PRECISION,
-                    n3 DOUBLE PRECISION,
-                    n4 DOUBLE PRECISION,
-                    n5 DOUBLE PRECISION,
-
-                    nota DOUBLE PRECISION,
-
-                    comentario TEXT,
-                    recomendacao TEXT,
-                    enviada_em TEXT,
-
-                    UNIQUE(
-                        trabalho_id,
-                        avaliador_id,
-                        tipo
-                    )
-                )
-            """)
-
-            # AUDITORIA
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS auditoria (
-                    id BIGSERIAL PRIMARY KEY,
-                    usuario TEXT,
-                    acao TEXT,
-                    quando TEXT
-                )
-            """)
-
-            # CONFIGURAÇÃO DOS CERTIFICADOS
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS certificado_config (
-                    id INTEGER PRIMARY KEY,
-
-                    prof1_nome TEXT DEFAULT '',
-                    prof1_cargo TEXT DEFAULT '',
-                    prof1_assinatura TEXT DEFAULT '',
-
-                    prof2_nome TEXT DEFAULT '',
-                    prof2_cargo TEXT DEFAULT '',
-                    prof2_assinatura TEXT DEFAULT '',
-
-                    prof3_nome TEXT DEFAULT '',
-                    prof3_cargo TEXT DEFAULT '',
-                    prof3_assinatura TEXT DEFAULT '',
-
-                    prof4_nome TEXT DEFAULT '',
-                    prof4_cargo TEXT DEFAULT '',
-                    prof4_assinatura TEXT DEFAULT '',
-
-                    data_inicio TEXT DEFAULT '',
-                    data_fim TEXT DEFAULT '',
-
-                    local TEXT DEFAULT 'Boa Vista/RR',
-
-                    CONSTRAINT certificado_config_singleton
-                        CHECK (id = 1)
-                )
-            """)
-
-            # USUÁRIO MASTER
-            cur.execute("""
-                INSERT INTO users (
-                    email,
-                    nome,
-                    perfil,
-                    senha,
-                    tipo_autenticacao,
-                    deve_trocar_senha
-                )
-                VALUES (%s, %s, 'master', %s, 'local', 0)
-
-                ON CONFLICT (email)
-                DO NOTHING
-            """, (
-                master_email,
-                master_name,
-                pw(master_password)
-            ))
-
         c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+
 
 def init_db():
-    _init_db_once()
+    import time
+    last = None
+    for tentativa in range(5):
+        try:
+            _init_db_once()
+            return
+        except (psycopg.OperationalError, psycopg.InterfaceError) as e:
+            last = e
+            if tentativa == 4:
+                raise
+            time.sleep(0.7 * (tentativa + 1))
+    if last:
+        raise last
+
 
 def q(sql,args=(),many=False):
-    # Pequena política de retry para locks momentâneos do SQLite.
-    import time
-    ultimo=None
-    for tentativa in range(6):
-        c=None
-        try:
-            c=conn(); cur=c.cursor(); cur.execute(sql,args)
-            rows=cur.fetchall() if sql.lstrip().upper().startswith('SELECT') else None
-            c.commit(); c.close(); return rows
-        except sqlite3.OperationalError as e:
-            ultimo=e
-            if c is not None:
-                try: c.rollback(); c.close()
-                except Exception: pass
-            if 'locked' not in str(e).lower() or tentativa == 5:
-                raise
-            time.sleep(0.35*(tentativa+1))
-    raise ultimo
+    """Executa uma consulta PostgreSQL e retorna linhas SELECT como dicts."""
+    c = conn()
+    try:
+        cur = c.cursor()
+        sql2 = _adapt_sql(sql)
+        cur.execute(sql2, args)
+        is_read = sql2.lstrip().upper().startswith(('SELECT','WITH','SHOW','EXPLAIN'))
+        if is_read:
+            rows = cur.fetchall()
+        else:
+            rows = None
+        c.commit()
+        return rows
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
 
-def _write_retry(fn, attempts=6):
-    import time
-    last=None
-    for i in range(attempts):
-        try:
-            return fn()
-        except sqlite3.OperationalError as e:
-            last=e
-            if 'locked' not in str(e).lower() or i == attempts-1:
-                raise
-            time.sleep(0.35*(i+1))
-    raise last
-
-def log(user,action): q('INSERT INTO auditoria(usuario,acao,quando) VALUES(?,?,?)',(user,action,now()))
 
 def df(sql,args=()):
-    c=conn()
+    """Executa SELECT e devolve DataFrame preservando nomes das colunas."""
+    c = conn()
     try:
-        return pd.read_sql_query(sql,c,params=args)
+        cur = c.cursor()
+        cur.execute(_adapt_sql(sql), args)
+        rows = cur.fetchall()
+        columns = [d.name for d in cur.description] if cur.description else []
+        return pd.DataFrame(rows, columns=columns)
     finally:
         c.close()
 
 def user_by_email(email):
-    r=q('SELECT * FROM users WHERE lower(email)=lower(?) AND ativo=1',(email,)); return dict(r[0]) if r else None
+    r=q('SELECT * FROM users WHERE lower(email)=lower(?) AND ativo=1',(email,)); return r[0] if r else None
 
 def get_user(uid):
-    r=q('SELECT * FROM users WHERE id=?',(uid,)); return dict(r[0]) if r else None
+    r=q('SELECT * FROM users WHERE id=?',(uid,)); return r[0] if r else None
 
 def header():
     st.markdown('<div class="topbar">', unsafe_allow_html=True)
@@ -439,54 +376,24 @@ def page_dashboard():
     st.markdown('<div class="page-intro"><div class="page-intro-title">Visão geral</div><div class="page-intro-text">Acompanhe o andamento das avaliações e a distribuição dos trabalhos por área.</div></div>', unsafe_allow_html=True)
     b1, b2, b3 = st.columns([1, 1, 4])
     with b1:
-        if st.button('Criar backup do banco'):
-            backup_dir = BACKUP_DIR
-            backup_dir.mkdir(parents=True, exist_ok=True)
-            destino = backup_dir / f'avaliacao_{datetime.now().strftime("%Y%m%d_%H%M%S")}.db'
-            # Usa o mecanismo nativo de backup do SQLite para gerar um arquivo
-            # consistente mesmo quando o banco está em uso pelo Streamlit.
-            src=conn(); dst=sqlite3.connect(destino, timeout=30)
+        if st.button('Gerar backup dos dados'):
             try:
-                src.backup(dst)
-            finally:
-                try: dst.close()
-                except Exception: pass
-                try: src.close()
-                except Exception: pass
-            log(st.session_state.user['email'], f'Criou backup {destino.name}')
-            st.session_state['ultimo_backup']=destino.name
-            st.success(f'Backup criado: {destino.name}')
-    with b2:
-        backups=sorted(BACKUP_DIR.glob('*.db'), key=lambda x:x.stat().st_mtime, reverse=True) if BACKUP_DIR.exists() else []
-        if backups:
-            bsel=st.selectbox('Backup disponível', [x.name for x in backups], key='backup_download_sel')
-            bp=BACKUP_DIR/bsel
-            st.download_button('Baixar backup selecionado', bp.read_bytes(), bsel, 'application/x-sqlite3', key='download_backup')
-    with b3:
-        st.markdown('**Restaurar backup**')
-        up_backup=st.file_uploader('Envie um arquivo .db de backup', type=['db'], key='restore_backup_file')
-        confirmar_restore=st.checkbox('Confirmo que desejo substituir o banco atual pelo backup enviado.', key='confirm_restore')
-        if up_backup is not None and confirmar_restore and st.button('Restaurar backup', type='secondary', key='restore_backup_btn'):
-            tmp=DATA_DIR/'_restore_tmp.db'
-            try:
-                tmp.write_bytes(up_backup.getvalue())
-                test=sqlite3.connect(tmp, timeout=30)
-                ok=test.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
-                test.close()
-                if not ok: raise ValueError('O arquivo de backup não passou no teste de integridade do SQLite.')
-                # Fecha conexões próprias e troca atomicamente o arquivo.
-                os.replace(tmp, DB)
-                log(st.session_state.user['email'], f'Restaurou backup {up_backup.name}')
-                st.success('Backup restaurado com sucesso. A página será recarregada.')
-                st.rerun()
+                data = _database_backup_bytes()
+                st.download_button(
+                    'Baixar backup (.zip)', data,
+                    f"backup_avaliacao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                    'application/zip', key='download_backup_now')
+                st.success('Backup gerado. Baixe o arquivo para mantê-lo fora do servidor.')
             except Exception as e:
-                try: tmp.unlink(missing_ok=True)
-                except Exception: pass
-                st.error(f'Não foi possível restaurar o backup: {e}')
+                st.error(f'Não foi possível gerar o backup: {e}')
+    with b2:
+        st.info('Os dados principais ficam no PostgreSQL/Supabase. O backup é baixado para o seu computador.')
+    with b3:
+        st.caption('PDFs e assinaturas enviados pela plataforma também são armazenados no banco PostgreSQL.')
     if st.session_state.user.get('perfil') == 'master':
         st.markdown('---')
         st.subheader('Reinicializar plataforma')
-        st.warning('Use somente para iniciar um novo ciclo/ano. A operação remove todos os trabalhos, PDFs/resumos, avaliações, atribuições, avaliadores, subcoordenadores e configurações de certificados, mantendo somente o coordenador master. Um backup automático será criado antes da limpeza.')
+        st.warning('Use somente para iniciar um novo ciclo/ano. A operação remove todos os trabalhos, PDFs/resumos, avaliações, atribuições, avaliadores, subcoordenadores e configurações de certificados, mantendo somente o coordenador master. Gere e baixe um backup antes de executar esta operação.')
         conf_reset=st.checkbox('Confirmo que desejo REINICIALIZAR a plataforma',key='conf_reinicializar')
         senha_reset=st.text_input('Senha do coordenador master',type='password',key='senha_reinicializar',help='A reinicialização só pode ser executada pelo coordenador master e exige a senha atual.')
         if conf_reset and st.button('Reinicializar',type='secondary',key='reinicializar_btn'):
@@ -503,7 +410,7 @@ def page_dashboard():
                 backup_name=_reinicializar_plataforma()
                 log(master['email'],f'Reinicializou a plataforma; backup automático {backup_name}')
                 st.session_state.user=get_user(int(master['id']))
-                _set_flash(f'Plataforma reinicializada com sucesso. Backup automático criado: {backup_name}.')
+                _set_flash('Plataforma reinicializada com sucesso. O banco PostgreSQL foi limpo, mantendo somente o coordenador master.')
                 st.rerun()
             except Exception as e:
                 st.error(f'Não foi possível reinicializar a plataforma: {e}')
@@ -586,17 +493,20 @@ def _senha_inicial_nome(nome):
 def _cert_config():
     r=df('SELECT * FROM certificado_config WHERE id=1')
     if r.empty:
-        q("INSERT OR IGNORE INTO certificado_config(id,prof1_nome,prof2_nome,prof3_nome,prof4_nome,local) VALUES(1,'','','','',?)",('Boa Vista/RR',))
+        q("INSERT INTO certificado_config(id,prof1_nome,prof2_nome,prof3_nome,prof4_nome,local) VALUES(1,'','','','',?) ON CONFLICT DO NOTHING",('Boa Vista/RR',))
         r=df('SELECT * FROM certificado_config WHERE id=1')
     return r.iloc[0].to_dict()
 
 def _save_signature(uploaded, slot):
-    if uploaded is None: return None
+    if uploaded is None:
+        return None
     ext=Path(uploaded.name).suffix.lower()
-    if ext not in ('.png','.jpg','.jpeg','.webp'): ext='.png'
-    path=SIGN_DIR/f'assinatura_{slot}{ext}'
-    path.write_bytes(uploaded.getvalue())
-    return str(path.relative_to(BASE)).replace('\\','/')
+    if ext not in ('.png','.jpg','.jpeg','.webp'):
+        ext='.png'
+    filename=f'assinatura_{slot}{ext}'
+    data=uploaded.getvalue()
+    q(f'UPDATE certificado_config SET prof{slot}_assinatura=?, prof{slot}_assinatura_dados=? WHERE id=1',(filename,data))
+    return filename
 
 def _date_range_pt(data_inicio, data_fim):
     meses=['janeiro','fevereiro','março','abril','maio','junho','julho','agosto','setembro','outubro','novembro','dezembro']
@@ -632,13 +542,11 @@ def page_import():
             else:
                 arq=f'{_safe_filename(codigo)}.pdf' if pdf_up is not None else ''
                 try:
-                    q('INSERT INTO trabalhos(codigo,nomes,area,titulo,resumo,arquivo,criado_em) VALUES(?,?,?,?,?,?,?)',(codigo.strip(),nomes.strip(),area.strip(),titulo.strip(),resumo.strip(),arq,now()))
-                    if pdf_up is not None:
-                        (PDF_DIR/arq).write_bytes(pdf_up.getvalue())
+                    q('INSERT INTO trabalhos(codigo,nomes,area,titulo,resumo,arquivo,arquivo_dados,criado_em) VALUES(?,?,?,?,?,?,?,?)',(codigo.strip(),nomes.strip(),area.strip(),titulo.strip(),resumo.strip(),arq,pdf_up.getvalue() if pdf_up is not None else None,now()))
                     log(st.session_state.user['email'],f'Cadastrou manualmente o trabalho {codigo.strip()}')
                     _set_flash(f'Trabalho {codigo.strip()} cadastrado com sucesso.')
                     st.rerun()
-                except sqlite3.IntegrityError:
+                except psycopg.IntegrityError:
                     st.error('Já existe um trabalho com esse código.')
                 except Exception as e:
                     st.error(f'Não foi possível cadastrar o trabalho: {e}')
@@ -659,7 +567,7 @@ def page_import():
             if not r['Código']: continue
             try:
                 q('''INSERT INTO trabalhos(codigo,nomes,area,titulo,resumo,arquivo,criado_em) VALUES(?,?,?,?,?,?,?)
-                     ON CONFLICT(codigo) DO UPDATE SET nomes=excluded.nomes,area=excluded.area,titulo=excluded.titulo,resumo=excluded.resumo,arquivo=excluded.arquivo''',tuple(r.tolist()+[now()]))
+                     ON CONFLICT(codigo) DO UPDATE SET nomes=excluded.nomes,area=excluded.area,titulo=excluded.titulo,resumo=excluded.resumo,arquivo=CASE WHEN excluded.arquivo<>'' THEN excluded.arquivo ELSE trabalhos.arquivo END''',tuple(r.tolist()+[now()]))
                 ok+=1
             except Exception as e: erros.append(f"{r['Código']}: {e}")
         log(st.session_state.user['email'],f'Importou/atualizou {ok} trabalhos por planilha')
@@ -671,18 +579,9 @@ def _delete_work_ids(ids):
     ids=[int(x) for x in ids]
     if not ids: return 0
     placeholders=','.join(['?']*len(ids))
-    # Guarda os nomes dos PDFs antes de excluir os registros.
-    rows=q(f"SELECT arquivo,codigo FROM trabalhos WHERE id IN ({placeholders})",tuple(ids))
     q(f"DELETE FROM avaliacoes WHERE trabalho_id IN ({placeholders})",tuple(ids))
     q(f"DELETE FROM atribuicoes WHERE trabalho_id IN ({placeholders})",tuple(ids))
     q(f"DELETE FROM trabalhos WHERE id IN ({placeholders})",tuple(ids))
-    for r in rows:
-        candidatos=[]
-        if r[0]: candidatos.append(Path(str(r[0])).name)
-        if r[1]: candidatos.append(f"{r[1]}.pdf")
-        for nome in dict.fromkeys(candidatos):
-            try: (PDF_DIR/nome).unlink(missing_ok=True)
-            except Exception: pass
     return len(ids)
 
 def _delete_evaluator_ids(ids):
@@ -695,33 +594,44 @@ def _delete_evaluator_ids(ids):
     q(f"DELETE FROM users WHERE id IN ({placeholders}) AND perfil='avaliador'",tuple(ids))
     return len(ids)
 
+def _database_backup_bytes():
+    """Gera um backup portátil dos dados PostgreSQL, incluindo PDFs e assinaturas."""
+    tables = ['users','trabalhos','atribuicoes','avaliacoes','auditoria','certificado_config']
+    payload = {'version': 1, 'created_at': now(), 'tables': {}}
+    for table in tables:
+        rows = q(f'SELECT * FROM {table}') or []
+        clean = []
+        for row in rows:
+            item = {}
+            for key, value in row.items():
+                if isinstance(value, (bytes, bytearray, memoryview)):
+                    item[key] = {'__bytes__': base64.b64encode(bytes(value)).decode('ascii')}
+                else:
+                    item[key] = value
+            clean.append(item)
+        payload['tables'][table] = clean
+    raw = json.dumps(payload, ensure_ascii=False, default=str, indent=2).encode('utf-8')
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('backup.json', raw)
+    return buf.getvalue()
+
+
 def _reinicializar_plataforma():
     """Limpa o ciclo do evento, preservando somente o coordenador master."""
-    # Backup automático antes da operação destrutiva.
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    destino=BACKUP_DIR/f"pre_reinicializacao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-    src=conn(); dst=sqlite3.connect(destino,timeout=30)
-    try: src.backup(dst)
-    finally:
-        try: dst.close()
-        except Exception: pass
-        try: src.close()
-        except Exception: pass
     q('DELETE FROM avaliacoes')
     q('DELETE FROM atribuicoes')
-    q("DELETE FROM trabalhos")
+    q('DELETE FROM trabalhos')
     q("DELETE FROM users WHERE perfil <> 'master'")
-    q("DELETE FROM auditoria")
-    q("INSERT OR IGNORE INTO certificado_config(id,local) VALUES(1,'Boa Vista/RR')")
-    q("UPDATE certificado_config SET prof1_nome='',prof1_cargo='',prof1_assinatura='',prof2_nome='',prof2_cargo='',prof2_assinatura='',prof3_nome='',prof3_cargo='',prof3_assinatura='',prof4_nome='',prof4_cargo='',prof4_assinatura='',data_inicio='',data_fim='',local='Boa Vista/RR' WHERE id=1")
-    # PDFs dos resumos e assinaturas pertencem ao ciclo anterior.
-    for pasta in (PDF_DIR,SIGN_DIR):
-        if pasta.exists():
-            for f in pasta.iterdir():
-                if f.is_file():
-                    try: f.unlink()
-                    except Exception: pass
-    return destino.name
+    q('DELETE FROM auditoria')
+    q("INSERT INTO certificado_config(id,local) VALUES(1,'Boa Vista/RR') ON CONFLICT DO NOTHING")
+    q("""UPDATE certificado_config SET
+        prof1_nome='',prof1_cargo='',prof1_assinatura='',prof1_assinatura_dados=NULL,
+        prof2_nome='',prof2_cargo='',prof2_assinatura='',prof2_assinatura_dados=NULL,
+        prof3_nome='',prof3_cargo='',prof3_assinatura='',prof3_assinatura_dados=NULL,
+        prof4_nome='',prof4_cargo='',prof4_assinatura='',prof4_assinatura_dados=NULL,
+        data_inicio='',data_fim='',local='Boa Vista/RR' WHERE id=1""")
+    return 'reinicialização concluída'
 
 def page_trabalhos():
     st.title('Trabalhos')
@@ -738,7 +648,7 @@ def page_trabalhos():
         names=[]
         if str(r.get('arquivo','')).strip(): names.append(Path(str(r['arquivo'])).name)
         names.append(f"{r['codigo']}.pdf")
-        return any((PDF_DIR/n).is_file() for n in dict.fromkeys(names))
+        return bool(r.get('arquivo_dados'))
     d['PDF']=d.apply(lambda r:'Disponível' if pdf_exists(r) else 'Não enviado',axis=1)
     st.dataframe(d[['codigo','nomes','area','titulo','arquivo','PDF']].rename(columns={'codigo':'Código','nomes':'Autores','area':'Área','titulo':'Título'}),width='stretch',hide_index=True)
     st.caption('A coluna PDF indica se o documento está salvo na pasta de resumos.')
@@ -751,8 +661,10 @@ def page_trabalhos():
         pdf_up=st.file_uploader('Enviar/substituir PDF',type=['pdf'],key=f'pdf_{int(row.id)}')
         if pdf_up is not None: arq=f'{_safe_filename(code)}.pdf'
         if st.button('Salvar alterações',type='primary') and qtd_av==0:
-            q('UPDATE trabalhos SET area=?,titulo=?,nomes=?,resumo=?,arquivo=? WHERE codigo=?',(area,titulo,nomes,resumo,arq,code))
-            if pdf_up is not None: (PDF_DIR/arq).write_bytes(pdf_up.getvalue())
+            if pdf_up is not None:
+                q('UPDATE trabalhos SET area=?,titulo=?,nomes=?,resumo=?,arquivo=?,arquivo_dados=? WHERE codigo=?',(area,titulo,nomes,resumo,arq,pdf_up.getvalue(),code))
+            else:
+                q('UPDATE trabalhos SET area=?,titulo=?,nomes=?,resumo=?,arquivo=? WHERE codigo=?',(area,titulo,nomes,resumo,arq,code))
             log(st.session_state.user['email'],f'Editou trabalho {code}'); _set_flash(f'Trabalho {code} atualizado com sucesso.'); st.rerun()
     st.subheader('Excluir trabalhos e resumos')
     st.warning('A exclusão é definitiva e também remove avaliações, atribuições e a entrada correspondente nos relatórios. É permitida mesmo quando o trabalho já foi avaliado.')
@@ -799,7 +711,7 @@ def page_users():
                     try:
                         q('INSERT INTO users(nome,email,perfil,senha,ativo,tipo_autenticacao,deve_trocar_senha) VALUES(?,?,?,?,1,\'local\',1)',(nome,email,'avaliador',pw(senha_inicial)))
                         cred.append({'Nome':nome,'E-mail':email,'Senha inicial':senha_inicial}); ok+=1
-                    except sqlite3.IntegrityError:
+                    except psycopg.IntegrityError:
                         # Outra linha da própria planilha ou outra sessão pode ter criado a conta.
                         continue
                     except Exception as e: erros.append(f'{email}: {e}')
@@ -855,8 +767,8 @@ def page_users():
         confirmar_exclusao=st.checkbox('Confirmo que desejo excluir definitivamente este avaliador',key=f'conf_excluir_av_{uid}')
         if confirmar_exclusao and st.button('Excluir avaliador definitivamente',type='secondary',key=f'excluir_av_{uid}'):
             try:
-                qtd_eval=int(q('SELECT COUNT(*) FROM avaliacoes WHERE avaliador_id=?',(uid,))[0][0])
-                qtd_atr=int(q('SELECT COUNT(*) FROM atribuicoes WHERE avaliador_id=?',(uid,))[0][0])
+                qtd_eval=int((q('SELECT COUNT(*) AS n FROM avaliacoes WHERE avaliador_id=?',(uid,)) or [{'n':0}])[0]['n'])
+                qtd_atr=int((q('SELECT COUNT(*) AS n FROM atribuicoes WHERE avaliador_id=?',(uid,)) or [{'n':0}])[0]['n'])
                 _delete_evaluator_ids([uid])
                 log(st.session_state.user['email'],f'Excluiu avaliador {uid} (avaliações={qtd_eval}, atribuições={qtd_atr})')
                 st.success('Avaliador excluído com sucesso.')
@@ -940,15 +852,15 @@ def page_evaluator():
     code=selected_code; tr=d[d.codigo.astype(str)==str(code)].iloc[0]
     st.subheader(f'{tr.codigo} - {tr.titulo}'); st.caption(f'Área: {tr.area} · Papel: {"Terceiro avaliador" if tr.tipo=="terceiro" else "Avaliador principal"}')
     with st.expander('Resumo do trabalho',expanded=True):
-        st.write(tr.resumo or 'Resumo não informado.'); nomes_pdf=[]
-        if tr.arquivo and str(tr.arquivo).strip(): nomes_pdf.append(Path(str(tr.arquivo)).name)
-        nomes_pdf.append(f'{tr.codigo}.pdf'); pdf_path=next((PDF_DIR/n for n in dict.fromkeys(nomes_pdf) if (PDF_DIR/n).is_file()),None)
-        if pdf_path is not None:
-            pdf_bytes=pdf_path.read_bytes(); st.markdown('**Visualização do PDF**')
+        st.write(tr.resumo or 'Resumo não informado.')
+        pdf_bytes = bytes(tr.arquivo_dados) if tr.arquivo_dados is not None else None
+        if pdf_bytes:
+            pdf_name = Path(str(tr.arquivo)).name if tr.arquivo else f'{tr.codigo}.pdf'
+            st.markdown('**Visualização do PDF**')
             try: st.pdf(pdf_bytes,height=760)
             except AttributeError:
                 encoded=base64.b64encode(pdf_bytes).decode('ascii'); components.html(f'<object data="data:application/pdf;base64,{encoded}" type="application/pdf" width="100%" height="760"><p>Use o botão abaixo para baixar.</p></object>',height=780,scrolling=True)
-            st.download_button('Baixar PDF do trabalho',pdf_bytes,file_name=pdf_path.name,mime='application/pdf')
+            st.download_button('Baixar PDF do trabalho',pdf_bytes,file_name=pdf_name,mime='application/pdf')
         else: st.warning('PDF ainda não disponibilizado pela coordenação.')
     if int(tr.id) in doneids: st.success('Sua avaliação já foi enviada.'); return
     st.subheader('Ficha de avaliação'); vals=[]
@@ -1192,28 +1104,28 @@ def _certificate_pdf(r, config, kind='premiacao'):
         (179.1, 135.0, 424.1, config.get('prof3_nome',''), config.get('prof3_cargo',''), config.get('prof3_assinatura','')),
         (442.61, 135.0, 687.61, config.get('prof4_nome',''), config.get('prof4_cargo',''), config.get('prof4_assinatura','')),
     ]
-    for x0, yline, x1, nome, cargo, sigrel in slots:
+    for slot, (x0, yline, x1, nome, cargo, sigrel) in enumerate(slots, 1):
         c.setStrokeColor(blue)
         c.setLineWidth(2.2)
         c.line(x0, yline, x1, yline)
 
-        if sigrel:
-            sp = BASE / sigrel
-            if sp.exists():
-                try:
-                    im = Image.open(sp).convert('RGBA')
-                    iw, ih = im.size
-                    maxw = x1-x0-12
-                    maxh = 34
-                    scale = min(maxw/iw, maxh/ih)
-                    sw, sh = iw*scale, ih*scale
-                    c.drawImage(
-                        ImageReader(im), x0+(x1-x0-sw)/2,
-                        yline+2+(maxh-sh)/2,
-                        width=sw, height=sh, mask='auto',
-                        preserveAspectRatio=True)
-                except Exception:
-                    pass
+        # A assinatura binária fica no PostgreSQL/Supabase.
+        sigdata = config.get(f'prof{slot}_assinatura_dados')
+        if sigdata:
+            try:
+                im = Image.open(io.BytesIO(bytes(sigdata))).convert('RGBA')
+                iw, ih = im.size
+                maxw = x1-x0-12
+                maxh = 34
+                scale = min(maxw/iw, maxh/ih)
+                sw, sh = iw*scale, ih*scale
+                c.drawImage(
+                    ImageReader(im), x0+(x1-x0-sw)/2,
+                    yline+2+(maxh-sh)/2,
+                    width=sw, height=sh, mask='auto',
+                    preserveAspectRatio=True)
+            except Exception:
+                pass
 
         # Nomes dos signatários com fonte maior.
         ps = ParagraphStyle(
@@ -1284,10 +1196,9 @@ def _certificate_settings_ui(key_suffix):
         up=st.file_uploader(f'Upload da assinatura do Professor {i}',type=['png','jpg','jpeg','webp'],key=f'sig{i}_{key_suffix}')
         if up is not None:
             rel=_save_signature(up,i)
-            q(f'UPDATE certificado_config SET prof{i}_assinatura=? WHERE id=1',(rel,))
             cfg[f'prof{i}_assinatura']=rel
             st.success(f'Assinatura do Professor {i} salva.')
-        if cfg.get(f'prof{i}_assinatura') and (BASE/cfg[f'prof{i}_assinatura']).exists():
+        if cfg.get(f'prof{i}_assinatura') and cfg.get(f'prof{i}_assinatura_dados'):
             st.caption(f"Assinatura cadastrada: {Path(cfg[f'prof{i}_assinatura']).name}")
     return _cert_config()
 
