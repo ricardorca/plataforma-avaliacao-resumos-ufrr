@@ -306,6 +306,19 @@ def df(sql,args=()):
     finally:
         c.close()
 
+def now():
+    """Retorna data/hora atual em formato textual para os registros do sistema."""
+    return datetime.now().isoformat(timespec='seconds')
+
+
+def log(usuario, acao):
+    """Registra uma ação na tabela de auditoria."""
+    q(
+        'INSERT INTO auditoria(usuario,acao,quando) VALUES(?,?,?)',
+        (str(usuario), str(acao), now())
+    )
+
+
 def user_by_email(email):
     r=q('SELECT * FROM users WHERE lower(email)=lower(?) AND ativo=1',(email,)); return r[0] if r else None
 
