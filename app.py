@@ -130,7 +130,7 @@ def verify_password(password, stored):
 
 def now(): return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-def _init_db_once():def _init_db_once():
+def _init_db_once():
 
     master_email = os.getenv(
         'MASTER_EMAIL',
