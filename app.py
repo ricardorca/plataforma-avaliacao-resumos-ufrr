@@ -130,56 +130,168 @@ def verify_password(password, stored):
 
 def now(): return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-def _init_db_once():
-    c=conn(); cur=c.cursor()
-    cur.executescript('''
-    CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,email TEXT UNIQUE,nome TEXT,perfil TEXT,senha TEXT,ativo INTEGER DEFAULT 1,tipo_autenticacao TEXT DEFAULT 'local',deve_trocar_senha INTEGER DEFAULT 0);
-    CREATE TABLE IF NOT EXISTS trabalhos(id INTEGER PRIMARY KEY AUTOINCREMENT,codigo TEXT UNIQUE,nomes TEXT,area TEXT,titulo TEXT,resumo TEXT,arquivo TEXT,criado_em TEXT);
-    CREATE TABLE IF NOT EXISTS atribuicoes(id INTEGER PRIMARY KEY AUTOINCREMENT,trabalho_id INTEGER,avaliador_id INTEGER,tipo TEXT DEFAULT 'principal',UNIQUE(trabalho_id,avaliador_id,tipo));
-    CREATE TABLE IF NOT EXISTS avaliacoes(id INTEGER PRIMARY KEY AUTOINCREMENT,trabalho_id INTEGER,avaliador_id INTEGER,tipo TEXT DEFAULT 'principal',n1 REAL,n2 REAL,n3 REAL,n4 REAL,n5 REAL,nota REAL,comentario TEXT,recomendacao TEXT,enviada_em TEXT,UNIQUE(trabalho_id,avaliador_id,tipo));
-    CREATE TABLE IF NOT EXISTS auditoria(id INTEGER PRIMARY KEY AUTOINCREMENT,usuario TEXT,acao TEXT,quando TEXT);
-    CREATE TABLE IF NOT EXISTS certificado_config(id INTEGER PRIMARY KEY CHECK(id=1),prof1_nome TEXT DEFAULT '',prof1_cargo TEXT DEFAULT '',prof1_assinatura TEXT DEFAULT '',prof2_nome TEXT DEFAULT '',prof2_cargo TEXT DEFAULT '',prof2_assinatura TEXT DEFAULT '',prof3_nome TEXT DEFAULT '',prof3_cargo TEXT DEFAULT '',prof3_assinatura TEXT DEFAULT '',prof4_nome TEXT DEFAULT '',prof4_cargo TEXT DEFAULT '',prof4_assinatura TEXT DEFAULT '',data_inicio TEXT DEFAULT '',data_fim TEXT DEFAULT '',local TEXT DEFAULT 'Boa Vista/RR');
-    ''')
-    # Migração compatível com bancos anteriores.
-    tcols=[r[1] for r in cur.execute('PRAGMA table_info(trabalhos)').fetchall()]
-    if 'nomes' not in tcols: cur.execute("ALTER TABLE trabalhos ADD COLUMN nomes TEXT DEFAULT ''")
-    cols=[r[1] for r in cur.execute('PRAGMA table_info(users)').fetchall()]
-    if 'tipo_autenticacao' not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN tipo_autenticacao TEXT DEFAULT 'local'")
-    if 'deve_trocar_senha' not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN deve_trocar_senha INTEGER DEFAULT 0")
-    acols=[r[1] for r in cur.execute('PRAGMA table_info(avaliacoes)').fetchall()]
-    if 'recomendacao' not in acols:
-        cur.execute("ALTER TABLE avaliacoes ADD COLUMN recomendacao TEXT")
-    # Inicialização: não criar avaliadores demonstrativos.
-    # A conta master é configurada por variáveis de ambiente, evitando
-    # publicar uma senha fixa no código-fonte.
-    master_email = os.getenv('MASTER_EMAIL', 'admin@example.local').strip().lower()
-    master_name = os.getenv('MASTER_NAME', 'Administrador local').strip()
-    master_password = os.getenv('MASTER_INITIAL_PASSWORD', '')
+def _init_db_once():def _init_db_once():
+
+    master_email = os.getenv(
+        'MASTER_EMAIL',
+        'admin@example.local'
+    ).strip().lower()
+
+    master_name = os.getenv(
+        'MASTER_NAME',
+        'Administrador local'
+    ).strip()
+
+    master_password = os.getenv(
+        'MASTER_INITIAL_PASSWORD',
+        ''
+    )
+
     if not master_password:
-        c.rollback(); c.close()
-        raise RuntimeError('MASTER_INITIAL_PASSWORD não configurada. Crie um arquivo .env a partir de .env.example antes de iniciar a aplicação.')
-    cur.execute("INSERT OR IGNORE INTO users(email,nome,perfil,senha,tipo_autenticacao,deve_trocar_senha) VALUES(?,?,?,?,?,0)",(master_email,master_name,'master',pw(master_password),'local'))
-    # Não conceder acesso automaticamente a qualquer domínio institucional.
-    # O usuário precisa estar previamente cadastrado na tabela users.
-    c.commit(); c.close()
+        raise RuntimeError(
+            'MASTER_INITIAL_PASSWORD não configurada nos Secrets.'
+        )
+
+    with conn() as c:
+        with c.cursor() as cur:
+
+            # USUÁRIOS
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id BIGSERIAL PRIMARY KEY,
+                    email TEXT UNIQUE,
+                    nome TEXT,
+                    perfil TEXT,
+                    senha TEXT,
+                    ativo INTEGER DEFAULT 1,
+                    tipo_autenticacao TEXT DEFAULT 'local',
+                    deve_trocar_senha INTEGER DEFAULT 0
+                )
+            """)
+
+            # TRABALHOS
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS trabalhos (
+                    id BIGSERIAL PRIMARY KEY,
+                    codigo TEXT UNIQUE,
+                    nomes TEXT,
+                    area TEXT,
+                    titulo TEXT,
+                    resumo TEXT,
+                    arquivo TEXT,
+                    criado_em TEXT
+                )
+            """)
+
+            # ATRIBUIÇÕES
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS atribuicoes (
+                    id BIGSERIAL PRIMARY KEY,
+                    trabalho_id BIGINT,
+                    avaliador_id BIGINT,
+                    tipo TEXT DEFAULT 'principal',
+
+                    UNIQUE(
+                        trabalho_id,
+                        avaliador_id,
+                        tipo
+                    )
+                )
+            """)
+
+            # AVALIAÇÕES
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS avaliacoes (
+                    id BIGSERIAL PRIMARY KEY,
+                    trabalho_id BIGINT,
+                    avaliador_id BIGINT,
+                    tipo TEXT DEFAULT 'principal',
+
+                    n1 DOUBLE PRECISION,
+                    n2 DOUBLE PRECISION,
+                    n3 DOUBLE PRECISION,
+                    n4 DOUBLE PRECISION,
+                    n5 DOUBLE PRECISION,
+
+                    nota DOUBLE PRECISION,
+
+                    comentario TEXT,
+                    recomendacao TEXT,
+                    enviada_em TEXT,
+
+                    UNIQUE(
+                        trabalho_id,
+                        avaliador_id,
+                        tipo
+                    )
+                )
+            """)
+
+            # AUDITORIA
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS auditoria (
+                    id BIGSERIAL PRIMARY KEY,
+                    usuario TEXT,
+                    acao TEXT,
+                    quando TEXT
+                )
+            """)
+
+            # CONFIGURAÇÃO DOS CERTIFICADOS
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS certificado_config (
+                    id INTEGER PRIMARY KEY,
+
+                    prof1_nome TEXT DEFAULT '',
+                    prof1_cargo TEXT DEFAULT '',
+                    prof1_assinatura TEXT DEFAULT '',
+
+                    prof2_nome TEXT DEFAULT '',
+                    prof2_cargo TEXT DEFAULT '',
+                    prof2_assinatura TEXT DEFAULT '',
+
+                    prof3_nome TEXT DEFAULT '',
+                    prof3_cargo TEXT DEFAULT '',
+                    prof3_assinatura TEXT DEFAULT '',
+
+                    prof4_nome TEXT DEFAULT '',
+                    prof4_cargo TEXT DEFAULT '',
+                    prof4_assinatura TEXT DEFAULT '',
+
+                    data_inicio TEXT DEFAULT '',
+                    data_fim TEXT DEFAULT '',
+
+                    local TEXT DEFAULT 'Boa Vista/RR',
+
+                    CONSTRAINT certificado_config_singleton
+                        CHECK (id = 1)
+                )
+            """)
+
+            # USUÁRIO MASTER
+            cur.execute("""
+                INSERT INTO users (
+                    email,
+                    nome,
+                    perfil,
+                    senha,
+                    tipo_autenticacao,
+                    deve_trocar_senha
+                )
+                VALUES (%s, %s, 'master', %s, 'local', 0)
+
+                ON CONFLICT (email)
+                DO NOTHING
+            """, (
+                master_email,
+                master_name,
+                pw(master_password)
+            ))
+
+        c.commit()
 
 def init_db():
-    # Em alguns ambientes o Streamlit mantém uma execução anterior por alguns instantes.
-    # Tentar novamente evita o erro 'database is locked' sem exigir intervenção manual.
-    import time
-    last=None
-    for tentativa in range(8):
-        try:
-            _init_db_once()
-            return
-        except sqlite3.OperationalError as e:
-            last=e
-            if 'locked' not in str(e).lower() or tentativa == 7:
-                raise
-            time.sleep(0.5*(tentativa+1))
-    raise last
+    _init_db_once()
 
 def q(sql,args=(),many=False):
     # Pequena política de retry para locks momentâneos do SQLite.
