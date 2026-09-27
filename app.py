@@ -85,6 +85,40 @@ CRITERIOS = [
 ]
 RECOMENDACOES = ['Aprovado sem correção', 'Aprovado com correção', 'Não aprovado']
 
+
+def pw(password):
+    """Gera um hash PBKDF2-SHA256 compatível com a própria plataforma."""
+    password = str(password)
+    iterations = 260000
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        'sha256', password.encode('utf-8'), salt.encode('utf-8'), iterations
+    ).hex()
+    return f'pbkdf2_sha256${iterations}${salt}${digest}'
+
+
+def verify_password(password, stored):
+    """Verifica senhas PBKDF2 e mantém compatibilidade com SHA-256 legado."""
+    if not stored:
+        return False
+    stored = str(stored)
+    password = str(password)
+
+    if stored.startswith('pbkdf2_sha256$'):
+        try:
+            _, iterations, salt, digest = stored.split('$', 3)
+            iterations = int(iterations)
+            calculated = hashlib.pbkdf2_hmac(
+                'sha256', password.encode('utf-8'), salt.encode('utf-8'), iterations
+            ).hex()
+            return hmac.compare_digest(calculated, digest)
+        except (ValueError, TypeError):
+            return False
+
+    # Compatibilidade com contas antigas que usavam SHA-256 simples.
+    legacy = hashlib.sha256(password.encode('utf-8')).hexdigest()
+    return hmac.compare_digest(legacy, stored)
+
 def _secret(name, default=''):
     """Lê um segredo do Streamlit Cloud e, como fallback, do ambiente."""
     try:
