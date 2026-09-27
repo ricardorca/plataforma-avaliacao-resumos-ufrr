@@ -1,6 +1,7 @@
 # Bibliotecas usadas pela aplicação. A maior parte da interface é feita com Streamlit.
 import streamlit as st
-import sqlite3, hashlib, secrets, io, base64, hmac, shutil, os
+import hashlib, secrets, io, base64, hmac, shutil, os
+import psycopg
 from pathlib import Path
 from datetime import datetime
 import unicodedata
@@ -88,9 +89,15 @@ CRITERIOS = [
 RECOMENDACOES = ['Aprovado sem correção', 'Aprovado com correção', 'Não aprovado']
 
 def conn():
-    # Conexão tolerante a concorrência do Streamlit/SQLite.
-    # WAL permite leituras simultâneas e busy_timeout evita falhas transitórias.
-    c=sqlite3.connect(DB, timeout=30, check_same_thread=False)
+    """Abre uma conexão com o PostgreSQL do Supabase."""
+    database_url = os.getenv('DATABASE_URL', '').strip()
+
+    if not database_url:
+        raise RuntimeError(
+            'DATABASE_URL não configurada nos Secrets do Streamlit.'
+        )
+
+    return psycopg.connect(database_url)
     c.row_factory=sqlite3.Row
     try:
         c.execute('PRAGMA journal_mode=WAL')
