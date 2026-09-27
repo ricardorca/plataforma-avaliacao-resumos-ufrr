@@ -273,23 +273,6 @@ def init_db():
         raise last
 
 
-def now():
-    """Retorna data e hora atual no formato usado pela plataforma."""
-    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-
-def log(user, action):
-    """Registra uma ação na tabela de auditoria."""
-    q(
-        'INSERT INTO auditoria(usuario,acao,quando) VALUES(?,?,?)',
-        (user, action, now())
-    )
-
-
-def q(sql,args=(),many=False):
-    """Executa uma consulta PostgreSQL e retorna linhas SELECT como dicts."""
-    c = conn()
-
 def q(sql,args=(),many=False):
     """Executa uma consulta PostgreSQL e retorna linhas SELECT como dicts."""
     c = conn()
@@ -499,7 +482,7 @@ def page_dashboard():
       FROM trabalhos t"""
     if filtro_area != 'Todas as áreas':
         data_sql += ' WHERE t.area = ?'
-    data_sql += ' ORDER BY t.area, CAST(t.codigo AS INTEGER), t.codigo'
+    data_sql += ' ORDER BY t.area, NULLIF(regexp_replace(t.codigo, \'[^0-9]\', \'\', \'g\'), \'\')::INTEGER, t.codigo'
     data=df(data_sql, params)
     def status(r):
         if r.atribuidores<1: return 'Sem avaliador atribuído'
@@ -882,7 +865,7 @@ def page_distribution():
         st.success('Atribuições atualizadas. Avaliações já enviadas foram preservadas.')
         st.rerun()
     st.subheader('Distribuição atual')
-    st.dataframe(df("""SELECT t.codigo,t.area,t.titulo,u.nome,u.email,a.tipo,CASE WHEN EXISTS(SELECT 1 FROM avaliacoes x WHERE x.trabalho_id=a.trabalho_id AND x.avaliador_id=a.avaliador_id AND x.tipo=a.tipo) THEN 'Avaliação enviada' ELSE 'Pendente' END AS status FROM atribuicoes a JOIN trabalhos t ON t.id=a.trabalho_id JOIN users u ON u.id=a.avaliador_id ORDER BY t.area,CAST(t.codigo AS INTEGER),t.codigo,a.tipo"""),width='stretch',hide_index=True)
+    st.dataframe(df("""SELECT t.codigo,t.area,t.titulo,u.nome,u.email,a.tipo,CASE WHEN EXISTS(SELECT 1 FROM avaliacoes x WHERE x.trabalho_id=a.trabalho_id AND x.avaliador_id=a.avaliador_id AND x.tipo=a.tipo) THEN 'Avaliação enviada' ELSE 'Pendente' END AS status FROM atribuicoes a JOIN trabalhos t ON t.id=a.trabalho_id JOIN users u ON u.id=a.avaliador_id ORDER BY t.area,NULLIF(regexp_replace(t.codigo, \'[^0-9]\', \'\', \'g\'), \'\')::INTEGER,t.codigo,a.tipo"""),width='stretch',hide_index=True)
 def assigned(uid):
     d=df('''SELECT t.*,a.tipo FROM atribuicoes a JOIN trabalhos t ON t.id=a.trabalho_id WHERE a.avaliador_id=?''',(uid,))
     return _sort_codes(d) if not d.empty else d
@@ -942,7 +925,7 @@ def page_discrep():
             q("INSERT OR IGNORE INTO atribuicoes(trabalho_id,avaliador_id,tipo) VALUES(?,?,?)",(int(r.id),opts[choice],'terceiro')); log(st.session_state.user['email'],f'Atribuiu terceiro avaliador ao trabalho {r.codigo}'); st.success('Terceiro avaliador atribuído.'); st.rerun()
 
 def _results_table():
-    ev=df('''SELECT t.id,t.codigo,t.nomes,t.area,t.titulo,a.id avaliacao_id,a.tipo,a.avaliador_id,u.nome avaliador,a.n1,a.n2,a.n3,a.n4,a.n5,a.nota,a.comentario,a.recomendacao,a.enviada_em FROM trabalhos t JOIN avaliacoes a ON a.trabalho_id=t.id JOIN users u ON u.id=a.avaliador_id ORDER BY t.area,CAST(t.codigo AS INTEGER),t.codigo,a.id''')
+    ev=df('''SELECT t.id,t.codigo,t.nomes,t.area,t.titulo,a.id avaliacao_id,a.tipo,a.avaliador_id,u.nome avaliador,a.n1,a.n2,a.n3,a.n4,a.n5,a.nota,a.comentario,a.recomendacao,a.enviada_em FROM trabalhos t JOIN avaliacoes a ON a.trabalho_id=t.id JOIN users u ON u.id=a.avaliador_id ORDER BY t.area,NULLIF(regexp_replace(t.codigo, \'[^0-9]\', \'\', \'g\'), \'\')::INTEGER,t.codigo,a.id''')
     if ev.empty: return pd.DataFrame()
     rows=[]
     for tid,g in ev.groupby('id',sort=False):
@@ -1257,7 +1240,7 @@ def page_reports():
     st.title('Relatórios e documentos oficiais')
     st.caption('Relatórios, notas e comentários das avaliações, certificados de premiação e certificados gerais de apresentação.')
     piv=_results_table()
-    all_ev=df("""SELECT t.id AS trabalho_id,t.codigo,t.nomes,t.area,t.titulo,t.arquivo,a.id AS avaliacao_id,a.tipo,a.nota,a.n1,a.n2,a.n3,a.n4,a.n5,a.comentario,a.recomendacao,a.enviada_em,u.nome avaliador FROM trabalhos t JOIN avaliacoes a ON a.trabalho_id=t.id JOIN users u ON u.id=a.avaliador_id ORDER BY t.area,CAST(t.codigo AS INTEGER),t.codigo,a.id""")
+    all_ev=df("""SELECT t.id AS trabalho_id,t.codigo,t.nomes,t.area,t.titulo,t.arquivo,a.id AS avaliacao_id,a.tipo,a.nota,a.n1,a.n2,a.n3,a.n4,a.n5,a.comentario,a.recomendacao,a.enviada_em,u.nome avaliador FROM trabalhos t JOIN avaliacoes a ON a.trabalho_id=t.id JOIN users u ON u.id=a.avaliador_id ORDER BY t.area,NULLIF(regexp_replace(t.codigo, \'[^0-9]\', \'\', \'g\'), \'\')::INTEGER,t.codigo,a.id""")
     tipo=st.radio('Documento',['Relatório geral','Relatório por área','Notas e comentários','Comentários em PDF','Certificados de premiação','Certificados de apresentação'],horizontal=True)
     if tipo in ('Relatório geral','Relatório por área'):
         if piv.empty: st.info('Ainda não existem avaliações.'); return
