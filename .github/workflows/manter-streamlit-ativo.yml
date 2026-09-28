@@ -1,0 +1,35 @@
+name: Manter Streamlit ativo
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+
+  workflow_dispatch:
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Verificar período de manutenção
+        run: |
+          TODAY=$(date -u +%Y-%m-%d)
+
+          echo "Data UTC: $TODAY"
+
+          if [[ "$TODAY" < "2026-09-28" || "$TODAY" > "2026-10-31" ]]; then
+            echo "Fora do período de manutenção."
+            exit 0
+          fi
+
+      - name: Acessar plataforma Streamlit
+        run: |
+          echo "Acessando Científica UFRR..."
+
+          curl -L \
+            --fail \
+            --max-time 60 \
+            -A "GitHub-Actions-Streamlit-KeepAlive" \
+            https://cientifica-ufrr.streamlit.app/
+
+          echo "Acesso concluído."
