@@ -6,6 +6,7 @@ from datetime import datetime
 import unicodedata
 import pandas as pd
 import streamlit.components.v1 as components
+from streamlit_cookies_controller import CookieController  # pip: streamlit-cookies-controller==0.0.4
 import psycopg
 from psycopg.rows import dict_row
 
@@ -126,6 +127,94 @@ def _secret(name, default=''):
     except Exception:
         value = os.getenv(name, default)
     return str(value).strip() if value is not None else default
+
+
+# -----------------------------------------------------------------------------
+# Sessão persistente no navegador
+# -----------------------------------------------------------------------------
+# O st.session_state é perdido quando o usuário pressiona F5. Para preservar o
+# login, usamos um cookie persistente contendo apenas um token assinado. O token
+# não contém senha nem dados sensíveis; a assinatura HMAC impede sua alteração.
+COOKIE_NAME = 'ufrr_avaliacao_session'
+COOKIE_DAYS = 30
+
+def _cookie_controller():
+    return CookieController()
+
+
+def _cookie_secret():
+    """Obtém a chave do cookie. COOKIE_SECRET é preferível; o fallback evita
+    que a aplicação deixe de iniciar se o Secret ainda não tiver sido criado."""
+    explicit = _secret('COOKIE_SECRET', '')
+    if explicit:
+        return explicit.encode('utf-8')
+    material = (
+        _secret('DATABASE_URL', '') + '|' +
+        _secret('MASTER_INITIAL_PASSWORD', '') + '|UFRR_AVALIACAO_COOKIE_V1'
+    )
+    return hashlib.sha256(material.encode('utf-8')).digest()
+
+
+def _session_token(user_id, expires_at, password_fingerprint=''):
+    payload = f'{int(user_id)}.{int(expires_at)}.{password_fingerprint}'.encode('utf-8')
+    sig = hmac.new(_cookie_secret(), payload, hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(payload).decode('ascii').rstrip('=') + '.' + sig
+
+
+def _read_session_token(token):
+    try:
+        encoded, sig = str(token).split('.', 1)
+        padding = '=' * (-len(encoded) % 4)
+        payload = base64.urlsafe_b64decode((encoded + padding).encode('ascii'))
+        expected = hmac.new(_cookie_secret(), payload, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        user_id_s, expires_s, password_fingerprint = payload.decode('utf-8').split('.', 2)
+        user_id = int(user_id_s)
+        expires_at = int(expires_s)
+        if expires_at <= int(datetime.now().timestamp()):
+            return None
+        return user_id, password_fingerprint
+    except Exception:
+        return None
+
+
+def _set_login_cookie(user):
+    expires_at = int(datetime.now().timestamp()) + COOKIE_DAYS * 86400
+    password_fingerprint = hashlib.sha256(str(user.get('senha', '')).encode('utf-8')).hexdigest()
+    controller = _cookie_controller()
+    controller.set(COOKIE_NAME, _session_token(int(user['id']), expires_at, password_fingerprint))
+
+
+def _clear_login_cookie():
+    try:
+        _cookie_controller().remove(COOKIE_NAME)
+    except Exception:
+        pass
+
+
+def _restore_login_from_cookie():
+    """Restaura o usuário após F5/reconexão, validando-o novamente no banco."""
+    if 'user' in st.session_state:
+        return True
+    try:
+        token = _cookie_controller().get(COOKIE_NAME)
+    except Exception:
+        return False
+    if not token:
+        return False
+    session_data = _read_session_token(token)
+    if session_data is None:
+        _clear_login_cookie()
+        return False
+    user_id, password_fingerprint = session_data
+    user = get_user(user_id)
+    current_fingerprint = hashlib.sha256(str(user.get('senha', '')).encode('utf-8')).hexdigest() if user else ''
+    if not user or not user.get('ativo') or not hmac.compare_digest(password_fingerprint, current_fingerprint):
+        _clear_login_cookie()
+        return False
+    st.session_state.user = user
+    return True
 
 
 def _database_url():
@@ -360,7 +449,9 @@ def login():
                     q('UPDATE users SET senha=? WHERE id=?', (pw(senha), int(u['id'])))
                     u = get_user(int(u['id']))
                 log(u['email'], 'Login realizado')
-                st.session_state.user=u; st.rerun()
+                st.session_state.user = u
+                _set_login_cookie(u)
+                st.rerun()
             else: st.error('E-mail ou senha inválidos.')
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -377,7 +468,7 @@ def sidebar(items):
         label=('✓ ' if current==item else '')+item
         if st.sidebar.button(label,key=f'menu_{item}',width='stretch'):
             if item=='Sair':
-                log(u['email'], 'Logout realizado'); st.session_state.pop('user',None); st.session_state.pop('menu_choice',None); st.rerun()
+                log(u['email'], 'Logout realizado'); _clear_login_cookie(); st.session_state.pop('user',None); st.session_state.pop('menu_choice',None); st.rerun()
             st.session_state.menu_choice=item; escolha=item; st.rerun()
     return escolha
 
@@ -1551,6 +1642,7 @@ def _show_flash():
 def main():
     init_db()
     _show_flash()
+    _restore_login_from_cookie()
     if 'user' not in st.session_state:
         login()
         render_footer()
