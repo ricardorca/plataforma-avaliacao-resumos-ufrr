@@ -545,14 +545,37 @@ def _cert_config():
     return r.iloc[0].to_dict()
 
 def _save_signature(uploaded, slot):
+    """Valida e normaliza a assinatura antes de armazená-la no PostgreSQL.
+
+    Todas as assinaturas são convertidas para PNG RGBA. Isso evita problemas
+    com WEBP/JPEG ou arquivos de imagem malformados durante a geração do PDF.
+    """
     if uploaded is None:
         return None
-    ext=Path(uploaded.name).suffix.lower()
-    if ext not in ('.png','.jpg','.jpeg','.webp'):
-        ext='.png'
-    filename=f'assinatura_{slot}{ext}'
-    data=uploaded.getvalue()
-    q(f'UPDATE certificado_config SET prof{slot}_assinatura=?, prof{slot}_assinatura_dados=? WHERE id=1',(filename,data))
+    if slot not in (1, 2, 3, 4):
+        raise ValueError('Slot de assinatura inválido.')
+
+    from PIL import Image, UnidentifiedImageError
+
+    raw = uploaded.getvalue()
+    if not raw:
+        raise ValueError('O arquivo de assinatura está vazio.')
+
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            img.load()
+            normalized = img.convert('RGBA')
+            out = io.BytesIO()
+            normalized.save(out, format='PNG', optimize=True)
+            data = out.getvalue()
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise ValueError('O arquivo enviado não é uma imagem válida.') from exc
+
+    filename = f'assinatura_{slot}.png'
+    q(
+        f'UPDATE certificado_config SET prof{slot}_assinatura=?, prof{slot}_assinatura_dados=? WHERE id=1',
+        (filename, data),
+    )
     return filename
 
 def _date_range_pt(data_inicio, data_fim):
@@ -1160,18 +1183,27 @@ def _certificate_pdf(r, config, kind='premiacao'):
         sigdata = config.get(f'prof{slot}_assinatura_dados')
         if sigdata:
             try:
-                im = Image.open(io.BytesIO(bytes(sigdata))).convert('RGBA')
-                iw, ih = im.size
-                maxw = x1-x0-12
-                maxh = 34
-                scale = min(maxw/iw, maxh/ih)
-                sw, sh = iw*scale, ih*scale
-                c.drawImage(
-                    ImageReader(im), x0+(x1-x0-sw)/2,
-                    yline+2+(maxh-sh)/2,
-                    width=sw, height=sh, mask='auto',
-                    preserveAspectRatio=True)
+                raw_sig = bytes(sigdata)
+                with Image.open(io.BytesIO(raw_sig)) as im:
+                    im = im.convert('RGBA')
+                    iw, ih = im.size
+                    if iw > 0 and ih > 0:
+                        maxw = x1-x0-12
+                        maxh = 34
+                        scale = min(maxw/iw, maxh/ih)
+                        sw, sh = iw*scale, ih*scale
+                        sigbuf = io.BytesIO()
+                        im.save(sigbuf, format='PNG')
+                        sigbuf.seek(0)
+                        c.drawImage(
+                            ImageReader(sigbuf), x0+(x1-x0-sw)/2,
+                            yline+2+(maxh-sh)/2,
+                            width=sw, height=sh, mask='auto',
+                            preserveAspectRatio=True)
             except Exception:
+                # O certificado continua sendo gerado mesmo se uma assinatura
+                # antiga estiver corrompida; o problema será indicado na tela
+                # de configuração para que a assinatura possa ser reenviada.
                 pass
 
         # Nomes dos signatários com fonte maior.
@@ -1239,14 +1271,30 @@ def _certificate_settings_ui(key_suffix):
         st.rerun()
     cfg=_cert_config()
     st.write('**Assinaturas**')
+    st.caption('Envie cada assinatura como PNG, JPG, JPEG ou WEBP. O arquivo será convertido para PNG e armazenado no PostgreSQL.')
     for i in range(1,5):
-        up=st.file_uploader(f'Upload da assinatura do Professor {i}',type=['png','jpg','jpeg','webp'],key=f'sig{i}_{key_suffix}')
-        if up is not None:
-            rel=_save_signature(up,i)
-            cfg[f'prof{i}_assinatura']=rel
-            st.success(f'Assinatura do Professor {i} salva.')
-        if cfg.get(f'prof{i}_assinatura') and cfg.get(f'prof{i}_assinatura_dados'):
-            st.caption(f"Assinatura cadastrada: {Path(cfg[f'prof{i}_assinatura']).name}")
+        with st.container(border=True):
+            st.markdown(f'**Professor {i}**')
+            up=st.file_uploader(
+                f'Selecionar assinatura do Professor {i}',
+                type=['png','jpg','jpeg','webp'],
+                key=f'sig{i}_{key_suffix}',
+            )
+            col1,col2=st.columns([1,3])
+            with col1:
+                salvar_sig=st.button('Salvar assinatura',key=f'salvar_sig{i}_{key_suffix}',type='primary',disabled=up is None)
+            with col2:
+                if cfg.get(f'prof{i}_assinatura') and cfg.get(f'prof{i}_assinatura_dados'):
+                    st.caption(f"Assinatura cadastrada: {Path(str(cfg[f'prof{i}_assinatura'])).name}")
+                else:
+                    st.caption('Nenhuma assinatura cadastrada.')
+            if salvar_sig and up is not None:
+                try:
+                    rel=_save_signature(up,i)
+                    st.success(f'Assinatura do Professor {i} salva com sucesso.')
+                    cfg=_cert_config()
+                except Exception as exc:
+                    st.error(f'Não foi possível salvar a assinatura do Professor {i}: {exc}')
     return _cert_config()
 
 def page_reports():
@@ -1289,7 +1337,8 @@ def page_reports():
             items.append((f"{_safe_filename(r['codigo'])} - {_safe_filename(_author_text(r['nomes']))} - {int(r['Posição'])} lugar.pdf",_certificate_pdf(r,cfg,'premiacao')))
         st.download_button('Gerar todos os certificados de premiação (ZIP)',_zip_files(items),'certificados_premiacao.zip','application/zip')
         sel=st.selectbox('Certificado individual',[f"{i}. {r['codigo']} - {r['titulo']} - {int(r['Posição'])}º lugar" for i,(_,r) in enumerate(premiados.iterrows(),1)])
-        rr=premiados.iloc[premiados.apply(lambda r:f"{r['codigo']} - {r['titulo']} - {int(r['Posição'])}º lugar"==sel.split('. ',1)[1],axis=1).idxmax()]
+        mask=premiados.apply(lambda r:f"{r['codigo']} - {r['titulo']} - {int(r['Posição'])}º lugar"==sel.split('. ',1)[1],axis=1)
+        rr=premiados.loc[mask.idxmax()]
         st.download_button('Baixar certificado selecionado',_certificate_pdf(rr,cfg,'premiacao'),f"certificado_{_safe_filename(rr['codigo'])}.pdf",'application/pdf')
     else:
         works=df('SELECT id,codigo,nomes,area,titulo FROM trabalhos ORDER BY id ASC')
@@ -1299,7 +1348,8 @@ def page_reports():
         items=[(f"{_safe_filename(r['codigo'])} - participacao.pdf",_certificate_pdf(r,cfg,'participacao')) for _,r in works.iterrows()]
         st.download_button('Gerar todos os certificados de apresentação (ZIP)',_zip_files(items),'certificados_participacao.zip','application/zip')
         sel=st.selectbox('Certificado individual de apresentação',[f"{i}. {r['codigo']} - {r['titulo']}" for i,(_,r) in enumerate(works.iterrows(),1)])
-        rr=works.iloc[works.apply(lambda r:f"{r['codigo']} - {r['titulo']}"==sel.split('. ',1)[1],axis=1).idxmax()]
+        mask=works.apply(lambda r:f"{r['codigo']} - {r['titulo']}"==sel.split('. ',1)[1],axis=1)
+        rr=works.loc[mask.idxmax()]
         st.download_button('Baixar certificado selecionado',_certificate_pdf(rr,cfg,'participacao'),f"certificado_participacao_{_safe_filename(rr['codigo'])}.pdf",'application/pdf')
 def _excel_bytes(data,sheet='Dados'):
     buf=io.BytesIO()
@@ -1344,7 +1394,14 @@ def _show_flash():
         else: st.success(msg)
 
 def main():
-    init_db()
+    try:
+        init_db()
+    except Exception as exc:
+        st.error('A plataforma não conseguiu inicializar o banco de dados.')
+        st.warning('Verifique o Secret DATABASE_URL e a disponibilidade do PostgreSQL/Supabase.')
+        with st.expander('Detalhes técnicos'):
+            st.code(str(exc))
+        return
     _show_flash()
     if 'user' not in st.session_state:
         login()
