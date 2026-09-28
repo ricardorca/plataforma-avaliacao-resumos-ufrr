@@ -1,12 +1,12 @@
 # Bibliotecas usadas pela aplicação. A maior parte da interface é feita com Streamlit.
 import streamlit as st
-import hashlib, secrets, io, base64, hmac, shutil, os, re, json, zipfile
+import hashlib, secrets, io, base64, hmac, shutil, os, re, json, zipfile, time
 from pathlib import Path
 from datetime import datetime
 import unicodedata
 import pandas as pd
 import streamlit.components.v1 as components
-from streamlit_cookies_controller import CookieController  # pip: streamlit-cookies-controller==0.0.4
+from streamlit_cookies_controller import CookieController
 import psycopg
 from psycopg.rows import dict_row
 
@@ -139,7 +139,10 @@ COOKIE_NAME = 'ufrr_avaliacao_session'
 COOKIE_DAYS = 30
 
 def _cookie_controller():
-    return CookieController()
+    # Cada sessão do navegador recebe seu próprio componente.
+    # Não usamos st.cache_resource aqui: o componente é stateful no navegador
+    # e não deve ser compartilhado entre usuários/sessões.
+    return CookieController(key='ufrr_auth_cookie')
 
 
 def _cookie_secret():
@@ -155,8 +158,8 @@ def _cookie_secret():
     return hashlib.sha256(material.encode('utf-8')).digest()
 
 
-def _session_token(user_id, expires_at, password_fingerprint=''):
-    payload = f'{int(user_id)}.{int(expires_at)}.{password_fingerprint}'.encode('utf-8')
+def _session_token(user_id, expires_at):
+    payload = f'{int(user_id)}.{int(expires_at)}'.encode('utf-8')
     sig = hmac.new(_cookie_secret(), payload, hashlib.sha256).hexdigest()
     return base64.urlsafe_b64encode(payload).decode('ascii').rstrip('=') + '.' + sig
 
@@ -169,21 +172,28 @@ def _read_session_token(token):
         expected = hmac.new(_cookie_secret(), payload, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, expected):
             return None
-        user_id_s, expires_s, password_fingerprint = payload.decode('utf-8').split('.', 2)
+        user_id_s, expires_s = payload.decode('utf-8').split('.', 1)
         user_id = int(user_id_s)
         expires_at = int(expires_s)
         if expires_at <= int(datetime.now().timestamp()):
             return None
-        return user_id, password_fingerprint
+        return user_id
     except Exception:
         return None
 
 
-def _set_login_cookie(user):
+def _set_login_cookie(user_id):
     expires_at = int(datetime.now().timestamp()) + COOKIE_DAYS * 86400
-    password_fingerprint = hashlib.sha256(str(user.get('senha', '')).encode('utf-8')).hexdigest()
     controller = _cookie_controller()
-    controller.set(COOKIE_NAME, _session_token(int(user['id']), expires_at, password_fingerprint))
+    token = _session_token(user_id, expires_at)
+    controller.set(
+        COOKIE_NAME,
+        token,
+        max_age=COOKIE_DAYS * 86400,
+        path='/',
+        secure=True,
+        same_site='lax',
+    )
 
 
 def _clear_login_cookie():
@@ -197,20 +207,27 @@ def _restore_login_from_cookie():
     """Restaura o usuário após F5/reconexão, validando-o novamente no banco."""
     if 'user' in st.session_state:
         return True
+    controller = _cookie_controller()
     try:
-        token = _cookie_controller().get(COOKIE_NAME)
+        # O componente precisa inicializar no navegador após um F5.
+        # Tentamos a leitura imediatamente e, se ainda não houver resposta,
+        # damos ao componente um breve intervalo para disponibilizar os cookies.
+        token = controller.get(COOKIE_NAME)
+        if not token:
+            time.sleep(0.6)
+            controller.getAll()
+            time.sleep(0.4)
+            token = controller.get(COOKIE_NAME)
     except Exception:
         return False
     if not token:
         return False
-    session_data = _read_session_token(token)
-    if session_data is None:
+    user_id = _read_session_token(token)
+    if user_id is None:
         _clear_login_cookie()
         return False
-    user_id, password_fingerprint = session_data
     user = get_user(user_id)
-    current_fingerprint = hashlib.sha256(str(user.get('senha', '')).encode('utf-8')).hexdigest() if user else ''
-    if not user or not user.get('ativo') or not hmac.compare_digest(password_fingerprint, current_fingerprint):
+    if not user or not user.get('ativo'):
         _clear_login_cookie()
         return False
     st.session_state.user = user
@@ -450,7 +467,10 @@ def login():
                     u = get_user(int(u['id']))
                 log(u['email'], 'Login realizado')
                 st.session_state.user = u
-                _set_login_cookie(u)
+                _set_login_cookie(int(u['id']))
+                # Dá tempo para o componente frontend gravar o cookie antes
+                # de recriar a sessão Streamlit.
+                time.sleep(0.5)
                 st.rerun()
             else: st.error('E-mail ou senha inválidos.')
         st.markdown('</div>', unsafe_allow_html=True)
