@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Verificar período de manutenção
+      - name: Verificar período
         run: |
           TODAY=$(date -u +%Y-%m-%d)
 
@@ -22,14 +22,46 @@ jobs:
             exit 0
           fi
 
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Instalar Playwright
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
+
       - name: Acessar plataforma Streamlit
         run: |
-          echo "Acessando Científica UFRR..."
+          node <<'EOF'
+          const { chromium } = require('playwright');
 
-          curl -L \
-            --fail \
-            --max-time 60 \
-            -A "GitHub-Actions-Streamlit-KeepAlive" \
-            https://cientifica-ufrr.streamlit.app/
+          (async () => {
+            const browser = await chromium.launch({
+              headless: true
+            });
 
-          echo "Acesso concluído."
+            const page = await browser.newPage();
+
+            console.log('Abrindo Científica UFRR...');
+
+            await page.goto(
+              'https://cientifica-ufrr.streamlit.app/',
+              {
+                waitUntil: 'domcontentloaded',
+                timeout: 120000
+              }
+            );
+
+            console.log('Página carregada.');
+            console.log('Título:', await page.title());
+
+            await page.waitForTimeout(30000);
+
+            console.log('Acesso concluído.');
+
+            await browser.close();
+          })();
+          EOF
