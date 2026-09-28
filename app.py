@@ -75,6 +75,11 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOGO = BASE/'assets'/'brasao_ufrr.png'
 LOGIN_IMAGE = BASE/'assets'/'ufrr_foto_login_v24.jpg'
 
+# Tamanho máximo (px) das assinaturas armazenadas/embutidas nos certificados.
+# Uma assinatura não precisa de mais resolução que isso; fotos grandes eram a
+# principal causa de lentidão e estouro de memória na geração dos certificados.
+SIG_MAX_SIZE = (800, 200)
+
 # Critérios e pesos usados no cálculo da nota final.
 CRITERIOS = [
  ('Relevância do tema', .20),
@@ -136,11 +141,17 @@ def _database_url():
 
 
 def conn():
-    """Abre uma conexão PostgreSQL persistente no Supabase."""
+    """Abre uma conexão PostgreSQL no Supabase.
+
+    prepare_threshold=None desativa prepared statements do lado do servidor,
+    o que é necessário quando a DATABASE_URL aponta para o pooler do Supabase
+    em modo transação (pgbouncer/Supavisor) e é inofensivo na conexão direta.
+    """
     return psycopg.connect(
         _database_url(),
         row_factory=dict_row,
         connect_timeout=20,
+        prepare_threshold=None,
     )
 
 
@@ -457,6 +468,7 @@ def page_dashboard():
                 backup_name=_reinicializar_plataforma()
                 log(master['email'],f'Reinicializou a plataforma; backup automático {backup_name}')
                 st.session_state.user=get_user(int(master['id']))
+                _invalidate_cert_zips()
                 _set_flash('Plataforma reinicializada com sucesso. O banco PostgreSQL foi limpo, mantendo somente o coordenador master.')
                 st.rerun()
             except Exception as e:
@@ -544,30 +556,46 @@ def _cert_config():
         r=df('SELECT * FROM certificado_config WHERE id=1')
     return r.iloc[0].to_dict()
 
-def _save_signature(uploaded, slot):
-    """Valida e normaliza a assinatura antes de armazená-la no PostgreSQL.
+def _invalidate_cert_zips():
+    """Descarta ZIPs de certificados já gerados (dados/assinaturas mudaram)."""
+    st.session_state.pop('zip_participacao', None)
+    st.session_state.pop('zip_premiacao', None)
 
-    Todas as assinaturas são convertidas para PNG RGBA. Isso evita problemas
-    com WEBP/JPEG ou arquivos de imagem malformados durante a geração do PDF.
+def _shrink_signature_png(raw):
+    """Converte qualquer imagem em PNG RGBA limitado a SIG_MAX_SIZE.
+
+    Usada tanto ao salvar quanto ao gerar certificados (para assinaturas antigas
+    que ainda estejam grandes no banco).
+    """
+    from PIL import Image
+    with Image.open(io.BytesIO(raw)) as img:
+        img.load()
+        normalized = img.convert('RGBA')
+        normalized.thumbnail(SIG_MAX_SIZE)
+        out = io.BytesIO()
+        normalized.save(out, format='PNG', optimize=True)
+        return out.getvalue()
+
+def _save_signature(uploaded, slot):
+    """Valida, reduz e normaliza a assinatura antes de armazená-la no PostgreSQL.
+
+    Todas as assinaturas são convertidas para PNG RGBA e redimensionadas para no
+    máximo SIG_MAX_SIZE. Isso evita problemas com WEBP/JPEG/arquivos malformados
+    e, principalmente, evita fotos de vários MB pesando na geração dos PDFs.
     """
     if uploaded is None:
         return None
     if slot not in (1, 2, 3, 4):
         raise ValueError('Slot de assinatura inválido.')
 
-    from PIL import Image, UnidentifiedImageError
+    from PIL import UnidentifiedImageError
 
     raw = uploaded.getvalue()
     if not raw:
         raise ValueError('O arquivo de assinatura está vazio.')
 
     try:
-        with Image.open(io.BytesIO(raw)) as img:
-            img.load()
-            normalized = img.convert('RGBA')
-            out = io.BytesIO()
-            normalized.save(out, format='PNG', optimize=True)
-            data = out.getvalue()
+        data = _shrink_signature_png(raw)
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise ValueError('O arquivo enviado não é uma imagem válida.') from exc
 
@@ -577,6 +605,25 @@ def _save_signature(uploaded, slot):
         (filename, data),
     )
     return filename
+
+def _prepare_signatures(config):
+    """Prepara (uma única vez por lote) as assinaturas reduzidas dos 4 signatários."""
+    sigs = {}
+    for i in range(1, 5):
+        d = config.get(f'prof{i}_assinatura_dados')
+        if not d:
+            continue
+        try:
+            sigs[i] = _shrink_signature_png(bytes(d))
+        except Exception:
+            # Assinatura corrompida: o certificado sai sem ela.
+            pass
+    return sigs
+
+@st.cache_resource(show_spinner=False)
+def _template_bytes(path_str):
+    """Lê o PDF-base do certificado uma única vez e o mantém em cache."""
+    return Path(path_str).read_bytes()
 
 def _date_range_pt(data_inicio, data_fim):
     meses=['janeiro','fevereiro','março','abril','maio','junho','julho','agosto','setembro','outubro','novembro','dezembro']
@@ -614,6 +661,7 @@ def page_import():
                 try:
                     q('INSERT INTO trabalhos(codigo,nomes,area,titulo,resumo,arquivo,arquivo_dados,criado_em) VALUES(?,?,?,?,?,?,?,?)',(codigo.strip(),nomes.strip(),area.strip(),titulo.strip(),resumo.strip(),arq,pdf_up.getvalue() if pdf_up is not None else None,now()))
                     log(st.session_state.user['email'],f'Cadastrou manualmente o trabalho {codigo.strip()}')
+                    _invalidate_cert_zips()
                     _set_flash(f'Trabalho {codigo.strip()} cadastrado com sucesso.')
                     st.rerun()
                 except psycopg.IntegrityError:
@@ -641,6 +689,7 @@ def page_import():
                 ok+=1
             except Exception as e: erros.append(f"{r['Código']}: {e}")
         log(st.session_state.user['email'],f'Importou/atualizou {ok} trabalhos por planilha')
+        _invalidate_cert_zips()
         st.success(f'{ok} trabalho(s) importado(s)/atualizado(s).')
         if erros: st.warning('Alguns registros não foram processados: ' + ' | '.join(erros[:10]))
 
@@ -652,6 +701,7 @@ def _delete_work_ids(ids):
     q(f"DELETE FROM avaliacoes WHERE trabalho_id IN ({placeholders})",tuple(ids))
     q(f"DELETE FROM atribuicoes WHERE trabalho_id IN ({placeholders})",tuple(ids))
     q(f"DELETE FROM trabalhos WHERE id IN ({placeholders})",tuple(ids))
+    _invalidate_cert_zips()
     return len(ids)
 
 def _delete_evaluator_ids(ids):
@@ -662,6 +712,7 @@ def _delete_evaluator_ids(ids):
     q(f"DELETE FROM avaliacoes WHERE avaliador_id IN ({placeholders})",tuple(ids))
     q(f"DELETE FROM atribuicoes WHERE avaliador_id IN ({placeholders})",tuple(ids))
     q(f"DELETE FROM users WHERE id IN ({placeholders}) AND perfil='avaliador'",tuple(ids))
+    _invalidate_cert_zips()
     return len(ids)
 
 def _database_backup_bytes():
@@ -705,7 +756,8 @@ def _reinicializar_plataforma():
 
 def page_trabalhos():
     st.title('Trabalhos')
-    d=df('SELECT * FROM trabalhos')
+    # Não carrega o PDF (arquivo_dados) de todos os trabalhos: só um indicador booleano.
+    d=df('SELECT id,codigo,nomes,area,titulo,resumo,arquivo,criado_em,(arquivo_dados IS NOT NULL) AS tem_pdf FROM trabalhos')
     if d.empty: st.info('Nenhum trabalho cadastrado.'); return
     areas=sorted([a for a in d['area'].dropna().unique().tolist() if str(a).strip()],key=lambda x:str(x).lower())
     filtro_area=st.selectbox('Filtrar por área',['Todas as áreas']+areas,key='trabalhos_area')
@@ -714,14 +766,9 @@ def page_trabalhos():
     if d.empty: st.info('Nenhum trabalho encontrado para a área selecionada.'); return
     if ordem=='Crescente numérica': d=_sort_codes(d)
     else: d=d.sort_values('codigo',key=lambda x:x.astype(str).str.lower(),kind='stable')
-    def pdf_exists(r):
-        names=[]
-        if str(r.get('arquivo','')).strip(): names.append(Path(str(r['arquivo'])).name)
-        names.append(f"{r['codigo']}.pdf")
-        return bool(r.get('arquivo_dados'))
-    d['PDF']=d.apply(lambda r:'Disponível' if pdf_exists(r) else 'Não enviado',axis=1)
+    d['PDF']=d['tem_pdf'].apply(lambda v:'Disponível' if bool(v) else 'Não enviado')
     st.dataframe(d[['codigo','nomes','area','titulo','arquivo','PDF']].rename(columns={'codigo':'Código','nomes':'Autores','area':'Área','titulo':'Título'}),width='stretch',hide_index=True)
-    st.caption('A coluna PDF indica se o documento está salvo na pasta de resumos.')
+    st.caption('A coluna PDF indica se o documento está salvo no banco de dados.')
     codes=d.codigo.tolist(); code=st.selectbox('Selecione o código',codes)
     row=d[d.codigo==code].iloc[0]
     qtd_av=int(df('SELECT COUNT(*) n FROM avaliacoes WHERE trabalho_id=?',(int(row.id),)).iloc[0,0])
@@ -735,6 +782,7 @@ def page_trabalhos():
                 q('UPDATE trabalhos SET area=?,titulo=?,nomes=?,resumo=?,arquivo=?,arquivo_dados=? WHERE codigo=?',(area,titulo,nomes,resumo,arq,pdf_up.getvalue(),code))
             else:
                 q('UPDATE trabalhos SET area=?,titulo=?,nomes=?,resumo=?,arquivo=? WHERE codigo=?',(area,titulo,nomes,resumo,arq,code))
+            _invalidate_cert_zips()
             log(st.session_state.user['email'],f'Editou trabalho {code}'); _set_flash(f'Trabalho {code} atualizado com sucesso.'); st.rerun()
     st.subheader('Excluir trabalhos e resumos')
     st.warning('A exclusão é definitiva e também remove avaliações, atribuições e a entrada correspondente nos relatórios. É permitida mesmo quando o trabalho já foi avaliado.')
@@ -903,7 +951,9 @@ def page_distribution():
     st.subheader('Distribuição atual')
     st.dataframe(df("""SELECT t.codigo,t.area,t.titulo,u.nome,u.email,a.tipo,CASE WHEN EXISTS(SELECT 1 FROM avaliacoes x WHERE x.trabalho_id=a.trabalho_id AND x.avaliador_id=a.avaliador_id AND x.tipo=a.tipo) THEN 'Avaliação enviada' ELSE 'Pendente' END AS status FROM atribuicoes a JOIN trabalhos t ON t.id=a.trabalho_id JOIN users u ON u.id=a.avaliador_id ORDER BY t.area,NULLIF(regexp_replace(t.codigo, \'[^0-9]\', \'\', \'g\'), \'\')::INTEGER,t.codigo,a.tipo"""),width='stretch',hide_index=True)
 def assigned(uid):
-    d=df('''SELECT t.*,a.tipo FROM atribuicoes a JOIN trabalhos t ON t.id=a.trabalho_id WHERE a.avaliador_id=?''',(uid,))
+    # Não traz arquivo_dados (PDF) de todos os trabalhos atribuídos; o PDF é
+    # carregado apenas para o trabalho selecionado em page_evaluator.
+    d=df('''SELECT t.id,t.codigo,t.nomes,t.area,t.titulo,t.resumo,t.arquivo,a.tipo FROM atribuicoes a JOIN trabalhos t ON t.id=a.trabalho_id WHERE a.avaliador_id=?''',(uid,))
     return _sort_codes(d) if not d.empty else d
 
 def page_evaluator():
@@ -923,7 +973,10 @@ def page_evaluator():
     st.subheader(f'{tr.codigo} - {tr.titulo}'); st.caption(f'Área: {tr.area} · Papel: {"Terceiro avaliador" if tr.tipo=="terceiro" else "Avaliador principal"}')
     with st.expander('Resumo do trabalho',expanded=True):
         st.write(tr.resumo or 'Resumo não informado.')
-        pdf_bytes = bytes(tr.arquivo_dados) if tr.arquivo_dados is not None else None
+        # Carrega o PDF somente do trabalho selecionado.
+        pdf_rows=q('SELECT arquivo_dados FROM trabalhos WHERE id=?',(int(tr.id),))
+        pdf_raw=pdf_rows[0]['arquivo_dados'] if pdf_rows else None
+        pdf_bytes = bytes(pdf_raw) if pdf_raw is not None else None
         if pdf_bytes:
             pdf_name = Path(str(tr.arquivo)).name if tr.arquivo else f'{tr.codigo}.pdf'
             st.markdown('**Visualização do PDF**')
@@ -1082,12 +1135,16 @@ def _comment_pdf(records):
         story.append(KeepTogether(bloco))
     doc.build(story); return buf.getvalue()
 
-def _certificate_pdf(r, config, kind='premiacao'):
+def _certificate_pdf(r, config, kind='premiacao', sigs=None):
     """Gera o certificado sobre a moldura limpa fornecida pelo evento.
 
     O mesmo PDF-base é usado para apresentação e premiação. Como a moldura
     não contém campos de exemplo, nada é apagado do template; o código apenas
     acrescenta os dados variáveis.
+
+    `sigs` é o dicionário {slot: PNG reduzido} devolvido por
+    _prepare_signatures(). Ao gerar muitos certificados em lote, prepare-o uma
+    única vez e reutilize; se omitido, é preparado aqui (uso individual).
     """
     from reportlab.pdfgen import canvas
     from reportlab.lib import colors
@@ -1107,7 +1164,10 @@ def _certificate_pdf(r, config, kind='premiacao'):
     if not template.exists():
         raise FileNotFoundError('Modelo limpo de certificado não encontrado.')
 
-    reader = PdfReader(str(template))
+    if sigs is None:
+        sigs = _prepare_signatures(config)
+
+    reader = PdfReader(io.BytesIO(_template_bytes(str(template))))
     page = reader.pages[0]
     W = float(page.mediabox.width)
     H = float(page.mediabox.height)
@@ -1179,30 +1239,25 @@ def _certificate_pdf(r, config, kind='premiacao'):
         c.setLineWidth(2.2)
         c.line(x0, yline, x1, yline)
 
-        # A assinatura binária fica no PostgreSQL/Supabase.
-        sigdata = config.get(f'prof{slot}_assinatura_dados')
+        # Assinatura já reduzida (vem do PostgreSQL/Supabase via _prepare_signatures).
+        sigdata = sigs.get(slot)
         if sigdata:
             try:
-                raw_sig = bytes(sigdata)
-                with Image.open(io.BytesIO(raw_sig)) as im:
-                    im = im.convert('RGBA')
+                with Image.open(io.BytesIO(sigdata)) as im:
                     iw, ih = im.size
-                    if iw > 0 and ih > 0:
-                        maxw = x1-x0-12
-                        maxh = 34
-                        scale = min(maxw/iw, maxh/ih)
-                        sw, sh = iw*scale, ih*scale
-                        sigbuf = io.BytesIO()
-                        im.save(sigbuf, format='PNG')
-                        sigbuf.seek(0)
-                        c.drawImage(
-                            ImageReader(sigbuf), x0+(x1-x0-sw)/2,
-                            yline+2+(maxh-sh)/2,
-                            width=sw, height=sh, mask='auto',
-                            preserveAspectRatio=True)
+                if iw > 0 and ih > 0:
+                    maxw = x1-x0-12
+                    maxh = 34
+                    scale = min(maxw/iw, maxh/ih)
+                    sw, sh = iw*scale, ih*scale
+                    c.drawImage(
+                        ImageReader(io.BytesIO(sigdata)), x0+(x1-x0-sw)/2,
+                        yline+2+(maxh-sh)/2,
+                        width=sw, height=sh, mask='auto',
+                        preserveAspectRatio=True)
             except Exception:
                 # O certificado continua sendo gerado mesmo se uma assinatura
-                # antiga estiver corrompida; o problema será indicado na tela
+                # estiver corrompida; o problema será indicado na tela
                 # de configuração para que a assinatura possa ser reenviada.
                 pass
 
@@ -1223,7 +1278,7 @@ def _certificate_pdf(r, config, kind='premiacao'):
     # Data de emissão: preenchida automaticamente no momento da geração do
     # certificado. Não é escolhida pelo usuário e não usa as datas do evento.
     # Usamos o fuso de Roraima para que a data seja coerente mesmo se o servidor
-    # Oracle estiver configurado em UTC.
+    # estiver configurado em UTC.
     from zoneinfo import ZoneInfo
     data_emissao = datetime.now(ZoneInfo('America/Boa_Vista')).date()
     meses_emissao=['janeiro','fevereiro','março','abril','maio','junho','julho','agosto','setembro','outubro','novembro','dezembro']
@@ -1249,6 +1304,40 @@ def _zip_files(items):
         for name,data in items: z.writestr(name,data)
     return buf.getvalue()
 
+def _build_certificates_zip(rows, cfg, kind, name_fn):
+    """Gera o ZIP de certificados linha a linha, com barra de progresso.
+
+    Escreve cada PDF direto no ZIP (sem manter todos em uma lista) e reutiliza
+    as assinaturas preparadas uma única vez.
+    """
+    sigs = _prepare_signatures(cfg)
+    total = max(len(rows), 1)
+    prog = st.progress(0.0, text='Gerando certificados...')
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+        for n, (_, r) in enumerate(rows.iterrows(), 1):
+            z.writestr(name_fn(r), _certificate_pdf(r, cfg, kind, sigs))
+            prog.progress(n / total, text=f'Gerando certificados... {n}/{len(rows)}')
+    prog.empty()
+    return buf.getvalue()
+
+def _zip_section(state_key, button_label, download_label, download_name, rows, cfg, kind, name_fn):
+    """Botão que gera o ZIP só sob demanda + botão de download do resultado."""
+    if st.button(button_label, key=f'gen_{state_key}', type='primary'):
+        try:
+            data = _build_certificates_zip(rows, cfg, kind, name_fn)
+            st.session_state[state_key] = {
+                'data': data,
+                'quando': datetime.now().strftime('%d/%m/%Y %H:%M:%S'),
+                'qtd': len(rows),
+            }
+        except Exception as exc:
+            st.error(f'Não foi possível gerar os certificados: {exc}')
+    pronto = st.session_state.get(state_key)
+    if pronto:
+        st.download_button(download_label, pronto['data'], download_name, 'application/zip', key=f'dl_{state_key}')
+        st.caption(f"ZIP com {pronto['qtd']} certificado(s) gerado em {pronto['quando']}. Se alterar assinaturas, dados do evento ou trabalhos, gere novamente.")
+
 def _certificate_settings_ui(key_suffix):
     cfg=_cert_config()
     st.subheader('Configuração dos certificados')
@@ -1267,11 +1356,12 @@ def _certificate_settings_ui(key_suffix):
         args.extend([d1.strftime('%Y-%m-%d'),d2.strftime('%Y-%m-%d'),local.strip() or 'Boa Vista/RR'])
         q("UPDATE certificado_config SET prof1_nome=?,prof1_cargo=?,prof2_nome=?,prof2_cargo=?,prof3_nome=?,prof3_cargo=?,prof4_nome=?,prof4_cargo=?,data_inicio=?,data_fim=?,local=? WHERE id=1",tuple(args))
         log(st.session_state.user['email'],'Atualizou configuração dos certificados')
+        _invalidate_cert_zips()
         st.success('Dados dos certificados salvos.')
         st.rerun()
     cfg=_cert_config()
     st.write('**Assinaturas**')
-    st.caption('Envie cada assinatura como PNG, JPG, JPEG ou WEBP. O arquivo será convertido para PNG e armazenado no PostgreSQL.')
+    st.caption('Envie cada assinatura como PNG, JPG, JPEG ou WEBP. O arquivo será reduzido, convertido para PNG e armazenado no PostgreSQL.')
     for i in range(1,5):
         with st.container(border=True):
             st.markdown(f'**Professor {i}**')
@@ -1291,18 +1381,24 @@ def _certificate_settings_ui(key_suffix):
             if salvar_sig and up is not None:
                 try:
                     rel=_save_signature(up,i)
+                    _invalidate_cert_zips()
                     st.success(f'Assinatura do Professor {i} salva com sucesso.')
                     cfg=_cert_config()
                 except Exception as exc:
                     st.error(f'Não foi possível salvar a assinatura do Professor {i}: {exc}')
-    return _cert_config()
+    return cfg
 
 def page_reports():
     st.title('Relatórios e documentos oficiais')
     st.caption('Relatórios, notas e comentários das avaliações, certificados de premiação e certificados gerais de apresentação.')
-    piv=_results_table()
-    all_ev=df("""SELECT t.id AS trabalho_id,t.codigo,t.nomes,t.area,t.titulo,t.arquivo,a.id AS avaliacao_id,a.tipo,a.nota,a.n1,a.n2,a.n3,a.n4,a.n5,a.comentario,a.recomendacao,a.enviada_em,u.nome avaliador FROM trabalhos t JOIN avaliacoes a ON a.trabalho_id=t.id JOIN users u ON u.id=a.avaliador_id ORDER BY t.area,NULLIF(regexp_replace(t.codigo, \'[^0-9]\', \'\', \'g\'), \'\')::INTEGER,t.codigo,a.id""")
     tipo=st.radio('Documento',['Relatório geral','Relatório por área','Notas e comentários','Comentários em PDF','Certificados de premiação','Certificados de apresentação'],horizontal=True)
+
+    # As consultas pesadas só rodam nas abas que realmente as usam.
+    precisa_resultados = tipo in ('Relatório geral','Relatório por área','Certificados de premiação')
+    precisa_avaliacoes = tipo in ('Notas e comentários','Comentários em PDF')
+    piv = _results_table() if precisa_resultados else pd.DataFrame()
+    all_ev = df("""SELECT t.id AS trabalho_id,t.codigo,t.nomes,t.area,t.titulo,t.arquivo,a.id AS avaliacao_id,a.tipo,a.nota,a.n1,a.n2,a.n3,a.n4,a.n5,a.comentario,a.recomendacao,a.enviada_em,u.nome avaliador FROM trabalhos t JOIN avaliacoes a ON a.trabalho_id=t.id JOIN users u ON u.id=a.avaliador_id ORDER BY t.area,NULLIF(regexp_replace(t.codigo, \'[^0-9]\', \'\', \'g\'), \'\')::INTEGER,t.codigo,a.id""") if precisa_avaliacoes else pd.DataFrame()
+
     if tipo in ('Relatório geral','Relatório por área'):
         if piv.empty: st.info('Ainda não existem avaliações.'); return
         if tipo=='Relatório geral': g=piv; nome='relatorio_geral.pdf'
@@ -1322,20 +1418,28 @@ def page_reports():
         subset['_ord']=subset['tipo'].map({'principal':1,'principal2':2,'terceiro':3}).fillna(9)
         subset=subset.sort_values(['_ord','avaliacao_id']).drop(columns=['_ord'])
         data=_comment_pdf([row for _,row in subset.iterrows()]); base=_safe_filename(Path(str(subset.iloc[0]['arquivo'])).stem if str(subset.iloc[0].get('arquivo','')).strip() else subset.iloc[0]['codigo']); st.download_button('Baixar comentários em PDF',data,f'{base} _ comentario.pdf','application/pdf')
-        items=[]
-        for _,grp in all_ev.groupby(['codigo','titulo'],sort=False):
-            grp=grp.copy(); grp['_ord']=grp['tipo'].map({'principal':1,'principal2':2,'terceiro':3}).fillna(9); grp=grp.sort_values(['_ord','avaliacao_id']).drop(columns=['_ord']); rr=grp.iloc[0]; base=_safe_filename(Path(str(rr.get('arquivo',''))).stem if str(rr.get('arquivo','')).strip() else rr['codigo']); items.append((f'{base} _ comentario.pdf',_comment_pdf([row for _,row in grp.iterrows()])))
-        st.download_button('Gerar todos os comentários (ZIP)',_zip_files(items),'comentarios_avaliacoes.zip','application/zip')
+        # O ZIP com todos os comentários só é gerado quando solicitado.
+        if st.button('Preparar ZIP com todos os comentários',key='gen_zip_comentarios'):
+            items=[]
+            for _,grp in all_ev.groupby(['codigo','titulo'],sort=False):
+                grp=grp.copy(); grp['_ord']=grp['tipo'].map({'principal':1,'principal2':2,'terceiro':3}).fillna(9); grp=grp.sort_values(['_ord','avaliacao_id']).drop(columns=['_ord']); rr=grp.iloc[0]; base=_safe_filename(Path(str(rr.get('arquivo',''))).stem if str(rr.get('arquivo','')).strip() else rr['codigo']); items.append((f'{base} _ comentario.pdf',_comment_pdf([row for _,row in grp.iterrows()])))
+            st.session_state['zip_comentarios']=_zip_files(items)
+        if st.session_state.get('zip_comentarios'):
+            st.download_button('Baixar ZIP de todos os comentários',st.session_state['zip_comentarios'],'comentarios_avaliacoes.zip','application/zip',key='dl_zip_comentarios')
     elif tipo=='Certificados de premiação':
         if piv.empty: st.info('Ainda não há resultados.'); return
         cfg=_certificate_settings_ui('premiacao')
         premiados=piv[piv.Resultado=='Premiado'].copy()
         st.write(f'{len(premiados)} certificado(s) de premiação serão disponibilizados.')
         if premiados.empty: st.info('Não há premiados no momento.'); return
-        items=[]
-        for _,r in premiados.iterrows():
-            items.append((f"{_safe_filename(r['codigo'])} - {_safe_filename(_author_text(r['nomes']))} - {int(r['Posição'])} lugar.pdf",_certificate_pdf(r,cfg,'premiacao')))
-        st.download_button('Gerar todos os certificados de premiação (ZIP)',_zip_files(items),'certificados_premiacao.zip','application/zip')
+        _zip_section(
+            'zip_premiacao',
+            'Preparar ZIP com todos os certificados de premiação',
+            'Baixar ZIP dos certificados de premiação',
+            'certificados_premiacao.zip',
+            premiados, cfg, 'premiacao',
+            lambda r: f"{_safe_filename(r['codigo'])} - {_safe_filename(_author_text(r['nomes']))} - {int(r['Posição'])} lugar.pdf",
+        )
         sel=st.selectbox('Certificado individual',[f"{i}. {r['codigo']} - {r['titulo']} - {int(r['Posição'])}º lugar" for i,(_,r) in enumerate(premiados.iterrows(),1)])
         mask=premiados.apply(lambda r:f"{r['codigo']} - {r['titulo']} - {int(r['Posição'])}º lugar"==sel.split('. ',1)[1],axis=1)
         rr=premiados.loc[mask.idxmax()]
@@ -1344,9 +1448,15 @@ def page_reports():
         works=df('SELECT id,codigo,nomes,area,titulo FROM trabalhos ORDER BY id ASC')
         if works.empty: st.info('Ainda não há trabalhos cadastrados.'); return
         cfg=_certificate_settings_ui('participacao')
-        st.write('Os certificados de apresentação seguem o modelo fornecido e usam os mesmos dados do evento e assinaturas.')
-        items=[(f"{_safe_filename(r['codigo'])} - participacao.pdf",_certificate_pdf(r,cfg,'participacao')) for _,r in works.iterrows()]
-        st.download_button('Gerar todos os certificados de apresentação (ZIP)',_zip_files(items),'certificados_participacao.zip','application/zip')
+        st.write(f'{len(works)} trabalho(s). Os certificados de apresentação seguem o modelo fornecido e usam os mesmos dados do evento e assinaturas.')
+        _zip_section(
+            'zip_participacao',
+            'Preparar ZIP com todos os certificados de apresentação',
+            'Baixar ZIP dos certificados de apresentação',
+            'certificados_participacao.zip',
+            works, cfg, 'participacao',
+            lambda r: f"{_safe_filename(r['codigo'])} - participacao.pdf",
+        )
         sel=st.selectbox('Certificado individual de apresentação',[f"{i}. {r['codigo']} - {r['titulo']}" for i,(_,r) in enumerate(works.iterrows(),1)])
         mask=works.apply(lambda r:f"{r['codigo']} - {r['titulo']}"==sel.split('. ',1)[1],axis=1)
         rr=works.loc[mask.idxmax()]
