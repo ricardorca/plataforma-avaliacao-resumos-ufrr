@@ -1631,14 +1631,14 @@ def page_coordenadores():
         nome=st.text_input('Nome completo')
         email=st.text_input('E-mail')
         senha=st.text_input('Senha inicial',type='password')
-        ok=st.form_submit_button('Adicionar subcoordenador',type='primary')
+        ok=st.form_submit_button('Adicionar coordenador',type='primary')
     if ok:
         if not nome.strip() or not email.strip() or len(senha)<6:
             st.error('Informe nome, e-mail e uma senha inicial com pelo menos 6 caracteres.')
         else:
             try:
                 q("INSERT INTO users(nome,email,perfil,senha,ativo,tipo_autenticacao,deve_trocar_senha) VALUES(?,?,?,?,1,'local',1)",(nome.strip(),email.strip().lower(),'coord',pw(senha)))
-                st.success('Subcoordenador criado.')
+                st.success('coordenador criado.')
                 st.rerun()
             except Exception as e: st.error(f'Não foi possível criar a conta: {e}')
     st.subheader('Coordenadores cadastrados')
