@@ -548,7 +548,7 @@ def page_dashboard():
     if st.session_state.user.get('perfil') == 'master':
         st.markdown('---')
         st.subheader('Reinicializar plataforma')
-        st.warning('Use somente para iniciar um novo ciclo/ano. A operação remove todos os trabalhos, PDFs/resumos, avaliações, atribuições, avaliadores, subcoordenadores e configurações de certificados, mantendo somente o coordenador master. Gere e baixe um backup antes de executar esta operação.')
+        st.warning('Use somente para iniciar um novo ciclo/ano. A operação remove todos os trabalhos, PDFs/resumos, avaliações, atribuições, avaliadores, coordenadores e configurações de certificados, mantendo somente o coordenador master. Gere e baixe um backup antes de executar esta operação.')
         conf_reset=st.checkbox('Confirmo que desejo REINICIALIZAR a plataforma',key='conf_reinicializar')
         senha_reset=st.text_input('Senha do coordenador master',type='password',key='senha_reinicializar',help='A reinicialização só pode ser executada pelo coordenador master e exige a senha atual.')
         if conf_reset and st.button('Reinicializar',type='secondary',key='reinicializar_btn'):
@@ -1621,12 +1621,12 @@ def _excel_bytes(data,sheet='Dados'):
 
 def render_footer():
     st.markdown('<div class="app-footer"><strong>Aviso:</strong> esta não é uma página oficial nem é gerenciada pela UFRR. O conteúdo é de responsabilidade de seus idealizadores. PRPPG-UFRR.<br>Ferramenta destinada ao processo de avaliação de resumos científicos.</div>', unsafe_allow_html=True)
-def page_subcoordenadores():
-    st.title('Subcoordenadores')
+def page_coordenadores():
+    st.title('Coordenadores')
     if st.session_state.user.get('perfil') != 'master':
-        st.error('Somente o coordenador master pode adicionar subcoordenadores.')
+        st.error('Somente o coordenador master pode adicionar coordenadores.')
         return
-    st.caption('Subcoordenadores possuem as permissões da coordenação, exceto criar outros subcoordenadores.')
+    st.caption('Coordenadores possuem as permissões da coordenação, exceto criar outros coordenadores.')
     with st.form('novo_subcoord'):
         nome=st.text_input('Nome completo')
         email=st.text_input('E-mail')
@@ -1641,7 +1641,7 @@ def page_subcoordenadores():
                 st.success('Subcoordenador criado.')
                 st.rerun()
             except Exception as e: st.error(f'Não foi possível criar a conta: {e}')
-    st.subheader('Subcoordenadores cadastrados')
+    st.subheader('Coordenadores cadastrados')
     st.dataframe(df("SELECT nome,email,CASE WHEN ativo=1 THEN 'Ativo' ELSE 'Bloqueado' END AS status FROM users WHERE perfil='coord' ORDER BY nome"),hide_index=True,width='stretch')
 
 def _set_flash(message, kind='success'):
@@ -1671,9 +1671,9 @@ def main():
         render_footer()
         return
     if u['perfil'] in ('coord','master'):
-        items=['Painel','Avaliadores','Resumos','Trabalhos','Distribuição de trabalhos','Discrepâncias','Resultados','Relatórios e documentos','Subcoordenadores','Meu Perfil','Sair']
+        items=['Painel','Avaliadores','Resumos','Trabalhos','Distribuição de trabalhos','Discrepâncias','Resultados','Relatórios e documentos','Coordenadores','Meu Perfil','Sair']
         menu=sidebar(items)
-        routes={'Painel':page_dashboard,'Avaliadores':page_users,'Resumos':page_import,'Trabalhos':page_trabalhos,'Distribuição de trabalhos':page_distribution,'Discrepâncias':page_discrep,'Resultados':page_results,'Relatórios e documentos':page_reports,'Subcoordenadores':page_subcoordenadores,'Meu Perfil':page_profile}
+        routes={'Painel':page_dashboard,'Avaliadores':page_users,'Resumos':page_import,'Trabalhos':page_trabalhos,'Distribuição de trabalhos':page_distribution,'Discrepâncias':page_discrep,'Resultados':page_results,'Relatórios e documentos':page_reports,'Coordenadores':page_coordenadores,'Meu Perfil':page_profile}
         routes[menu]()
     else:
         menu=sidebar(['Meus trabalhos','Meu Perfil','Sair'])
