@@ -186,13 +186,10 @@ def _set_login_cookie(user_id):
     expires_at = int(datetime.now().timestamp()) + COOKIE_DAYS * 86400
     controller = _cookie_controller()
     token = _session_token(user_id, expires_at)
+
     controller.set(
         COOKIE_NAME,
         token,
-        max_age=COOKIE_DAYS * 86400,
-        path='/',
-        secure=True,
-        same_site='lax',
     )
 
 
