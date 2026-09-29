@@ -1345,7 +1345,7 @@ def _certificate_pdf(r, config, kind='premiacao', sigs=None):
     area = _area_label(r.get('area', ''))
     dr = _date_range_pt(config.get('data_inicio', ''), config.get('data_fim', ''))
     if kind == 'premiacao':
-        verbo = 'foram premiados' if multi else 'foi premiado'
+        verbo = 'foram premiados(as)' if multi else 'foi premiado(a)'
         lugar = f"{int(r['Posição'])}º Lugar"
         texto = (
             f"{verbo} em <b>{escape(lugar)}</b> na área <b>{escape(area)}</b>, "
