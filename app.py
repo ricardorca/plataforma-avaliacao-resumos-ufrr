@@ -224,19 +224,18 @@ def _restore_login_from_cookie():
         _clear_login_cookie()
         return False
     user = get_user(user_id)
+    if not user or not user.get('ativo'):
+        _clear_login_cookie()
+        return False
 
-if not user or not user.get('ativo'):
-    _clear_login_cookie()
-    return False
+    # Avaliadores não possuem login persistente.
+    # Mesmo que exista um cookie antigo, ele é eliminado e o login será solicitado.
+    if user.get('perfil') == 'avaliador':
+        _clear_login_cookie()
+        return False
 
-# Avaliadores NÃO possuem sessão persistente.
-# Mesmo que exista um cookie antigo, ele deve ser eliminado.
-if user.get('perfil') == 'avaliador':
-    _clear_login_cookie()
-    return False
-
-st.session_state.user = user
-return True
+    st.session_state.user = user
+    return True
 
 
 def _database_url():
@@ -473,19 +472,15 @@ def login():
                 log(u['email'], 'Login realizado')
                 st.session_state.user = u
 
-# Somente coordenação e master terão login persistente.
-# Avaliadores usam apenas a sessão atual do navegador.
-if u['perfil'] in ('coord', 'master'):
-    _set_login_cookie(int(u['id']))
-else:
-    _clear_login_cookie()
+                # Somente coordenação e master terão login persistente.
+                # Avaliadores usam apenas a sessão atual do navegador.
+                if u['perfil'] in ('coord', 'master'):
+                    _set_login_cookie(int(u['id']))
+                else:
+                    _clear_login_cookie()
 
-# Dá tempo para o componente frontend gravar/remover o cookie
-# antes de recriar a sessão Streamlit.
-time.sleep(0.5)
-st.rerun()
-                # Dá tempo para o componente frontend gravar o cookie antes
-                # de recriar a sessão Streamlit.
+                # Dá tempo para o componente frontend gravar/remover
+                # o cookie antes de recriar a sessão Streamlit.
                 time.sleep(0.5)
                 st.rerun()
             else: st.error('E-mail ou senha inválidos.')
