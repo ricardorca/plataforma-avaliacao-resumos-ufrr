@@ -350,6 +350,7 @@ def _init_db_once():
                 resumo TEXT,
                 arquivo TEXT,
                 arquivo_dados BYTEA,
+                arquivo_upload_nome TEXT DEFAULT '',
                 criado_em TEXT
             )""",
             """CREATE TABLE IF NOT EXISTS atribuicoes(
@@ -393,6 +394,7 @@ def _init_db_once():
         migrations = [
             "ALTER TABLE trabalhos ADD COLUMN IF NOT EXISTS nomes TEXT DEFAULT ''",
             "ALTER TABLE trabalhos ADD COLUMN IF NOT EXISTS arquivo_dados BYTEA",
+            "ALTER TABLE trabalhos ADD COLUMN IF NOT EXISTS arquivo_upload_nome TEXT DEFAULT ''",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS tipo_autenticacao TEXT DEFAULT 'local'",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS deve_trocar_senha INTEGER DEFAULT 0",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS area_avaliacao TEXT DEFAULT ''",
@@ -796,9 +798,14 @@ def page_import():
             if not codigo.strip() or not nomes.strip() or not area.strip() or not titulo.strip():
                 st.error('Código, nomes, área e título são obrigatórios.')
             else:
-                arq=f'{_safe_filename(codigo)}.pdf' if pdf_up is not None else ''
+                arq = pdf_up.name if pdf_up is not None else ''
+                nome_upload = pdf_up.name if pdf_up is not None else ''
                 try:
-                    q('INSERT INTO trabalhos(codigo,nomes,area,titulo,resumo,arquivo,arquivo_dados,criado_em) VALUES(?,?,?,?,?,?,?,?)',(codigo.strip(),nomes.strip(),area.strip(),titulo.strip(),resumo.strip(),arq,pdf_up.getvalue() if pdf_up is not None else None,now()))
+                    q(
+                        'INSERT INTO trabalhos(codigo,nomes,area,titulo,resumo,arquivo,arquivo_dados,arquivo_upload_nome,criado_em) VALUES(?,?,?,?,?,?,?,?,?)',
+                        (codigo.strip(), nomes.strip(), area.strip(), titulo.strip(), resumo.strip(),
+                         arq, pdf_up.getvalue() if pdf_up is not None else None, nome_upload, now())
+                    )
                     log(st.session_state.user['email'],f'Cadastrou manualmente o trabalho {codigo.strip()}')
                     _set_flash(f'Trabalho {codigo.strip()} cadastrado com sucesso.')
                     st.rerun()
@@ -951,9 +958,12 @@ def page_trabalhos():
                     # Preserva o nome do arquivo originalmente importado pela
                     # planilha/Excel. O upload do PDF altera somente os dados
                     # binários armazenados no banco.
+                    # `arquivo` é a referência importada do Excel e não é alterado.
+                    # O nome ORIGINAL do PDF enviado é armazenado separadamente.
+                    nome_upload_original = Path(str(pdf_up.name or 'documento.pdf')).name
                     q(
-                        'UPDATE trabalhos SET arquivo_dados=? WHERE id=?',
-                        (pdf_data,int(row.id))
+                        'UPDATE trabalhos SET arquivo_dados=?, arquivo_upload_nome=? WHERE id=?',
+                        (pdf_data, nome_upload_original, int(row.id))
                     )
                     log(st.session_state.user['email'],f'Anexou/substituiu o PDF do trabalho {code}')
                     _set_flash(f'PDF do trabalho {code} salvo com sucesso.')
@@ -975,10 +985,19 @@ def page_trabalhos():
     if nome_arquivo_registrado or arquivo_dados_atual is not None:
         st.subheader('Remover somente o PDF anexado')
 
+        nome_upload_original = str(row.get('arquivo_upload_nome') or '').strip()
         nome_pdf_atual = Path(
-            nome_arquivo_registrado or f'{code}.pdf'
+            nome_upload_original or nome_arquivo_registrado or f'{code}.pdf'
         ).name
-        st.caption(f'Arquivo registrado: **{nome_pdf_atual}**')
+        if not nome_pdf_atual.lower().endswith('.pdf'):
+            nome_pdf_atual += '.pdf'
+
+        if nome_arquivo_registrado:
+            st.caption(f'Referência do Excel — Nome do arquivo: **{nome_arquivo_registrado}**')
+        if nome_upload_original:
+            st.caption(f'Nome original do PDF enviado: **{nome_pdf_atual}**')
+        elif arquivo_dados_atual is not None:
+            st.caption(f'Nome do PDF: **{nome_pdf_atual}**')
 
         if arquivo_dados_atual is not None:
             pdf_atual_bytes = bytes(arquivo_dados_atual)
@@ -1009,7 +1028,7 @@ def page_trabalhos():
                     # O campo `arquivo` é preservado porque vem da planilha
                     # e continua sendo usado como referência/nome lógico do PDF.
                     q(
-                        'UPDATE trabalhos SET arquivo_dados=NULL WHERE id=?',
+                        'UPDATE trabalhos SET arquivo_dados=NULL, arquivo_upload_nome=NULL WHERE id=?',
                         (int(row.id),)
                     )
                     log(
@@ -1447,7 +1466,9 @@ def page_evaluator():
         st.write(tr.resumo or 'Resumo não informado.')
         pdf_bytes = bytes(tr.arquivo_dados) if tr.arquivo_dados is not None else None
         if pdf_bytes:
-            pdf_name = Path(str(tr.arquivo)).name if tr.arquivo else f'{tr.codigo}.pdf'
+            pdf_name = Path(str(tr.arquivo_upload_nome or tr.arquivo or f'{tr.codigo}.pdf')).name
+            if not pdf_name.lower().endswith('.pdf'):
+                pdf_name += '.pdf'
             st.markdown('**Visualização do PDF**')
             try: st.pdf(pdf_bytes,height=760)
             except AttributeError:
