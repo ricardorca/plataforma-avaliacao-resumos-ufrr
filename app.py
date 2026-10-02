@@ -948,10 +948,12 @@ def page_trabalhos():
                 if not pdf_data:
                     st.error('O arquivo PDF está vazio.')
                 else:
-                    nome_pdf=f'{_safe_filename(code)}.pdf'
+                    # Preserva o nome do arquivo originalmente importado pela
+                    # planilha/Excel. O upload do PDF altera somente os dados
+                    # binários armazenados no banco.
                     q(
-                        'UPDATE trabalhos SET arquivo=?, arquivo_dados=? WHERE id=?',
-                        (nome_pdf,pdf_data,int(row.id))
+                        'UPDATE trabalhos SET arquivo_dados=? WHERE id=?',
+                        (pdf_data,int(row.id))
                     )
                     log(st.session_state.user['email'],f'Anexou/substituiu o PDF do trabalho {code}')
                     _set_flash(f'PDF do trabalho {code} salvo com sucesso.')
@@ -1003,9 +1005,12 @@ def page_trabalhos():
                     type='secondary',
                     key=f'remover_pdf_{int(row.id)}'
                 ):
+                    # Remove somente o conteúdo binário do PDF.
+                    # O campo `arquivo` é preservado porque vem da planilha
+                    # e continua sendo usado como referência/nome lógico do PDF.
                     q(
-                        'UPDATE trabalhos SET arquivo=?, arquivo_dados=NULL WHERE id=?',
-                        ('', int(row.id))
+                        'UPDATE trabalhos SET arquivo_dados=NULL WHERE id=?',
+                        (int(row.id),)
                     )
                     log(
                         st.session_state.user['email'],
