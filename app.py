@@ -1230,7 +1230,13 @@ def page_distribution():
     st.title('Distribuição dos trabalhos')
 
     # Trabalhos disponíveis para distribuição.
-    t = df('SELECT id,codigo,area,titulo,arquivo FROM trabalhos')
+    # Também calculamos quantos avaliadores principais já estão atribuídos a cada trabalho.
+    t = df('''SELECT t.id,t.codigo,t.area,t.titulo,t.arquivo,
+                     COUNT(a.id) FILTER (WHERE a.tipo IN ('principal','principal2')) AS qtd_avaliadores
+              FROM trabalhos t
+              LEFT JOIN atribuicoes a ON a.trabalho_id=t.id
+              GROUP BY t.id,t.codigo,t.area,t.titulo,t.arquivo''')
+    t['qtd_avaliadores'] = t['qtd_avaliadores'].fillna(0).astype(int).clip(lower=0, upper=2)
     u = df("SELECT id,nome,email,area_avaliacao FROM users WHERE perfil='avaliador' AND ativo=1 ORDER BY nome")
 
     if t.empty or u.empty:
@@ -1274,12 +1280,28 @@ def page_distribution():
     )
 
     st.markdown('### Trabalhos disponíveis')
+    st.caption('🔴 0/2 — sem avaliadores   🟠 1/2 — um avaliador   🟢 2/2 — dois avaliadores')
+
+    tabela_trabalhos = t[['codigo', 'area', 'Nome do arquivo', 'qtd_avaliadores', 'titulo']].copy()
+    tabela_trabalhos['Avaliadores'] = tabela_trabalhos['qtd_avaliadores'].map({0: '0/2', 1: '1/2', 2: '2/2'})
+    tabela_trabalhos = tabela_trabalhos.drop(columns=['qtd_avaliadores']).rename(columns={
+        'codigo': 'Código',
+        'area': 'Área',
+        'titulo': 'Título'
+    })
+
+    def _cor_linha_distribuicao(row):
+        status = row['Avaliadores']
+        if status == '0/2':
+            cor = '#fde2e2'
+        elif status == '1/2':
+            cor = '#fff0d9'
+        else:
+            cor = '#e1f5e9'
+        return [f'background-color: {cor}'] * len(row)
+
     st.dataframe(
-        t[['codigo', 'area', 'Nome do arquivo', 'titulo']].rename(columns={
-            'codigo': 'Código',
-            'area': 'Área',
-            'titulo': 'Título'
-        }),
+        tabela_trabalhos.style.apply(_cor_linha_distribuicao, axis=1),
         width='stretch',
         hide_index=True
     )
