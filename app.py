@@ -894,6 +894,22 @@ def page_trabalhos():
             else:
                 q('UPDATE trabalhos SET area=?,titulo=?,nomes=?,resumo=?,arquivo=? WHERE codigo=?',(area,titulo,nomes,resumo,arq,code))
             log(st.session_state.user['email'],f'Editou trabalho {code}'); _set_flash(f'Trabalho {code} atualizado com sucesso.'); st.rerun()
+
+    # Exclusão somente do PDF anexado, preservando o trabalho e seus demais dados.
+    if row.get('arquivo_dados') is not None:
+        st.subheader('Excluir PDF anexado')
+        nome_pdf = Path(str(row.get('arquivo') or f'{code}.pdf')).name
+        st.caption(f'Arquivo atualmente anexado: **{nome_pdf}**')
+        if qtd_av:
+            st.info('O PDF não pode ser removido enquanto o trabalho possuir avaliações. Isso evita retirar do sistema o documento que serviu de base para o julgamento.')
+        else:
+            conf_pdf = st.checkbox('Confirmo que desejo excluir somente o PDF anexado deste trabalho', key=f'conf_excluir_pdf_{int(row.id)}')
+            if conf_pdf and st.button('Excluir PDF anexado', type='secondary', key=f'excluir_pdf_{int(row.id)}'):
+                q('UPDATE trabalhos SET arquivo=?, arquivo_dados=NULL WHERE id=?', ('', int(row.id)))
+                log(st.session_state.user['email'], f'Excluiu o PDF anexado do trabalho {code}')
+                _set_flash(f'PDF do trabalho {code} excluído com sucesso.')
+                st.rerun()
+
     st.subheader('Excluir trabalhos e resumos')
     st.warning('A exclusão é definitiva e também remove avaliações, atribuições e a entrada correspondente nos relatórios. É permitida mesmo quando o trabalho já foi avaliado.')
     todos_codes=[str(x) for x in d.codigo.tolist()]
