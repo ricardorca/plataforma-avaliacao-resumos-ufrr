@@ -119,12 +119,26 @@ def _grupo_area_avaliacao(valor):
 
 
 def _avaliadores_compativeis_com_area(frame, area_trabalho):
-    """Filtra avaliadores pelo grupo de área do trabalho."""
+    """Filtra avaliadores pelo grupo de área do trabalho.
+
+    Compatibilidade retroativa: contas de avaliadores criadas antes da
+    implantação do campo de área podem estar sem area_avaliacao. Se nenhuma
+    conta ativa ainda tiver área cadastrada, mantemos todos os avaliadores
+    disponíveis para não interromper a distribuição existente. Assim que ao
+    menos uma área for cadastrada, a regra de compatibilidade passa a ser
+    aplicada normalmente.
+    """
     if frame.empty:
         return frame
+
+    areas = frame['area_avaliacao'].fillna('').astype(str).str.strip()
+    if not areas.ne('').any():
+        return frame.copy()
+
     grupo = _grupo_area_avaliacao(area_trabalho)
     if not grupo:
         return frame.iloc[0:0].copy()
+
     return frame[
         frame['area_avaliacao'].fillna('').map(_grupo_area_avaliacao) == grupo
     ].copy()
@@ -1186,12 +1200,20 @@ def page_distribution():
     # Depois que o trabalho é selecionado, restringe os avaliadores ao mesmo
     # grupo de área do trabalho. CS/PG CS, por exemplo, pertencem ao mesmo grupo.
     u_area = _avaliadores_compativeis_com_area(u, tr.area)
+    areas_cadastradas = u['area_avaliacao'].fillna('').astype(str).str.strip().ne('').any()
     if u_area.empty:
         st.warning(
             f'Não há avaliadores ativos cadastrados para a área de {tr.area}. '
             'Cadastre/ajuste a área dos avaliadores em Gestão de avaliadores.'
         )
         return
+    if not areas_cadastradas:
+        st.info(
+            'Os avaliadores existentes ainda não possuem área cadastrada. '
+            'Por compatibilidade com os dados atuais, todos os avaliadores ativos '
+            'estão disponíveis. Assim que as áreas forem cadastradas, a plataforma '
+            'passará a restringir automaticamente os avaliadores por área.'
+        )
     u = u_area
 
     st.caption(
