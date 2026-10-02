@@ -118,30 +118,60 @@ def _grupo_area_avaliacao(valor):
     return str(valor or '').strip()
 
 
+def _area_avaliador_efetiva(nome, area_avaliacao):
+    """Determina a área do avaliador.
+
+    Primeiro usa o campo cadastrado `area_avaliacao`. Para manter compatibilidade
+    com contas antigas, quando esse campo estiver vazio tenta identificar o código
+    da área no início do nome, por exemplo `CA - Ana ...` ou `PG CS - João ...`.
+    """
+    area = str(area_avaliacao or '').strip()
+    if area:
+        return _grupo_area_avaliacao(area)
+
+    nome_txt = str(nome or '').strip()
+    prefixo = nome_txt.split('-', 1)[0].strip() if '-' in nome_txt else ''
+    if prefixo:
+        grupo = _grupo_area_avaliacao(prefixo)
+        if grupo in AREAS_AVALIACAO:
+            return grupo
+
+    # Também aceita prefixo antes de ':', caso alguma conta antiga use esse padrão.
+    prefixo = nome_txt.split(':', 1)[0].strip() if ':' in nome_txt else ''
+    if prefixo:
+        grupo = _grupo_area_avaliacao(prefixo)
+        if grupo in AREAS_AVALIACAO:
+            return grupo
+
+    return ''
+
+
 def _avaliadores_compativeis_com_area(frame, area_trabalho):
     """Filtra avaliadores pelo grupo de área do trabalho.
 
-    Compatibilidade retroativa: contas de avaliadores criadas antes da
-    implantação do campo de área podem estar sem area_avaliacao. Se nenhuma
-    conta ativa ainda tiver área cadastrada, mantemos todos os avaliadores
-    disponíveis para não interromper a distribuição existente. Assim que ao
-    menos uma área for cadastrada, a regra de compatibilidade passa a ser
-    aplicada normalmente.
+    O campo `area_avaliacao` tem prioridade. Para contas antigas, também
+    reconhece automaticamente a área quando o nome começa por `CA -`,
+    `PG CA -`, `CS -`, etc. Se nenhum avaliador tiver área identificável,
+    mantém todos disponíveis como compatibilidade de emergência.
     """
     if frame.empty:
         return frame
 
-    areas = frame['area_avaliacao'].fillna('').astype(str).str.strip()
-    if not areas.ne('').any():
+    grupos_efetivos = frame.apply(
+        lambda r: _area_avaliador_efetiva(r.get('nome'), r.get('area_avaliacao')),
+        axis=1
+    )
+
+    # Se nenhuma área puder ser identificada, preserva o comportamento antigo
+    # para não bloquear uma base legada.
+    if not grupos_efetivos.astype(str).str.strip().ne('').any():
         return frame.copy()
 
     grupo = _grupo_area_avaliacao(area_trabalho)
     if not grupo:
         return frame.iloc[0:0].copy()
 
-    return frame[
-        frame['area_avaliacao'].fillna('').map(_grupo_area_avaliacao) == grupo
-    ].copy()
+    return frame[grupos_efetivos == grupo].copy()
 
 
 def pw(password):
@@ -1063,12 +1093,18 @@ def page_users():
     st.title('Gestão de avaliadores')
     st.caption('Cadastre, edite, ative ou bloqueie contas de avaliadores. A área do avaliador define em quais áreas de trabalhos ele poderá ser distribuído.')
 
-    st.dataframe(
-        df("""SELECT id,nome,email,area_avaliacao AS area,perfil,tipo_autenticacao AS autenticacao,
+    usuarios_tabela = df("""SELECT id,nome,email,area_avaliacao,perfil,tipo_autenticacao AS autenticacao,
             CASE WHEN ativo=1 THEN 'Ativo' ELSE 'Bloqueado' END AS status
-            FROM users ORDER BY nome"""),
-        width='stretch', hide_index=True
-    )
+            FROM users ORDER BY nome""")
+    if not usuarios_tabela.empty:
+        usuarios_tabela['area'] = usuarios_tabela.apply(
+            lambda r: r.get('area_avaliacao') or (_normalizar_area_texto(str(r.get('nome','')).split('-',1)[0]).strip() if '-' in str(r.get('nome','')) else ''),
+            axis=1
+        )
+        st.dataframe(
+            usuarios_tabela[['id','nome','email','area','perfil','autenticacao','status']],
+            width='stretch', hide_index=True
+        )
 
     st.subheader('Importar avaliadores por planilha')
     st.caption('A planilha deve conter Nome, E-mail e Área. A Área pode ser CS, PG CS, CA, PG CA, CB, PG CB, CH, PG CH, CSA, PG CSA, CET, PG CET, ENG, PG ENG, LLA ou PG LLA.')
