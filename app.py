@@ -87,49 +87,6 @@ CRITERIOS = [
 RECOMENDACOES = ['Aprovado sem correção', 'Aprovado com correção', 'Não aprovado']
 
 
-# Grupos de áreas usados para compatibilizar a área do trabalho com a área do avaliador.
-# Ex.: um trabalho em Ciências da Saúde pode ser distribuído para avaliadores de CS ou PG CS.
-AREAS_AVALIACAO = {
-    'Ciências da Saúde': {'CS', 'PG CS'},
-    'Ciências Agrárias': {'CA', 'PG CA'},
-    'Ciências Biológicas': {'CB', 'PG CB'},
-    'Ciências Humanas': {'CH', 'PG CH'},
-    'Ciências Sociais Aplicadas': {'CSA', 'PG CSA'},
-    'Ciências Exatas e da Terra': {'CET', 'PG CET'},
-    'Engenharias': {'ENG', 'PG ENG'},
-    'Linguística, Letras e Artes': {'LLA', 'PG LLA'},
-}
-
-
-def _normalizar_area_texto(valor):
-    texto = str(valor or '').strip().upper()
-    texto = ' '.join(texto.split())
-    return texto
-
-
-def _grupo_area_avaliacao(valor):
-    """Retorna o grupo canônico de área ao qual o valor pertence."""
-    texto = _normalizar_area_texto(valor)
-    if not texto:
-        return ''
-    for grupo, aliases in AREAS_AVALIACAO.items():
-        if texto == _normalizar_area_texto(grupo) or texto in {_normalizar_area_texto(a) for a in aliases}:
-            return grupo
-    return str(valor or '').strip()
-
-
-def _avaliadores_compativeis_com_area(frame, area_trabalho):
-    """Filtra avaliadores pelo grupo de área do trabalho."""
-    if frame.empty:
-        return frame
-    grupo = _grupo_area_avaliacao(area_trabalho)
-    if not grupo:
-        return frame.iloc[0:0].copy()
-    return frame[
-        frame['area_avaliacao'].fillna('').map(_grupo_area_avaliacao) == grupo
-    ].copy()
-
-
 def pw(password):
     """Gera um hash PBKDF2-SHA256 compatível com a própria plataforma."""
     password = str(password)
@@ -270,6 +227,13 @@ def _restore_login_from_cookie():
     if not user or not user.get('ativo'):
         _clear_login_cookie()
         return False
+
+    # Avaliadores não possuem login persistente.
+    # Mesmo que exista um cookie antigo, ele é eliminado e o login será solicitado.
+    if user.get('perfil') == 'avaliador':
+        _clear_login_cookie()
+        return False
+
     st.session_state.user = user
     return True
 
@@ -374,7 +338,6 @@ def _init_db_once():
             "ALTER TABLE trabalhos ADD COLUMN IF NOT EXISTS arquivo_dados BYTEA",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS tipo_autenticacao TEXT DEFAULT 'local'",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS deve_trocar_senha INTEGER DEFAULT 0",
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS area_avaliacao TEXT DEFAULT ''",
             "ALTER TABLE avaliacoes ADD COLUMN IF NOT EXISTS recomendacao TEXT",
             "ALTER TABLE certificado_config ADD COLUMN IF NOT EXISTS prof1_assinatura_dados BYTEA",
             "ALTER TABLE certificado_config ADD COLUMN IF NOT EXISTS prof2_assinatura_dados BYTEA",
@@ -508,9 +471,16 @@ def login():
                     u = get_user(int(u['id']))
                 log(u['email'], 'Login realizado')
                 st.session_state.user = u
-                _set_login_cookie(int(u['id']))
-                # Dá tempo para o componente frontend gravar o cookie antes
-                # de recriar a sessão Streamlit.
+
+                # Somente coordenação e master terão login persistente.
+                # Avaliadores usam apenas a sessão atual do navegador.
+                if u['perfil'] in ('coord', 'master'):
+                    _set_login_cookie(int(u['id']))
+                else:
+                    _clear_login_cookie()
+
+                # Dá tempo para o componente frontend gravar/remover
+                # o cookie antes de recriar a sessão Streamlit.
                 time.sleep(0.5)
                 st.rerun()
             else: st.error('E-mail ou senha inválidos.')
@@ -895,17 +865,38 @@ def page_trabalhos():
                 q('UPDATE trabalhos SET area=?,titulo=?,nomes=?,resumo=?,arquivo=? WHERE codigo=?',(area,titulo,nomes,resumo,arq,code))
             log(st.session_state.user['email'],f'Editou trabalho {code}'); _set_flash(f'Trabalho {code} atualizado com sucesso.'); st.rerun()
 
-    # Exclusão somente do PDF anexado, preservando o trabalho e seus demais dados.
-    if row.get('arquivo_dados') is not None:
-        st.subheader('Excluir PDF anexado')
-        nome_pdf = Path(str(row.get('arquivo') or f'{code}.pdf')).name
-        st.caption(f'Arquivo atualmente anexado: **{nome_pdf}**')
+    # Gerenciamento do PDF atualmente anexado ao trabalho.
+    # O arquivo pode ser conferido/baixado e, quando ainda não há avaliações,
+    # removido sem alterar os demais dados do trabalho.
+    arquivo_dados_atual = row.get('arquivo_dados')
+    if arquivo_dados_atual is not None:
+        st.subheader('PDF atualmente anexado')
+        nome_pdf_atual = Path(str(row.get('arquivo') or f'{code}.pdf')).name
+        pdf_atual_bytes = bytes(arquivo_dados_atual)
+        st.caption(f'Arquivo: **{nome_pdf_atual}**')
+        st.download_button(
+            'Baixar/visualizar PDF atual',
+            data=pdf_atual_bytes,
+            file_name=nome_pdf_atual,
+            mime='application/pdf',
+            key=f'baixar_pdf_atual_{int(row.id)}'
+        )
         if qtd_av:
-            st.info('O PDF não pode ser removido enquanto o trabalho possuir avaliações. Isso evita retirar do sistema o documento que serviu de base para o julgamento.')
+            st.info('Este PDF não pode ser excluído porque o trabalho já possui avaliação(ões).')
         else:
-            conf_pdf = st.checkbox('Confirmo que desejo excluir somente o PDF anexado deste trabalho', key=f'conf_excluir_pdf_{int(row.id)}')
-            if conf_pdf and st.button('Excluir PDF anexado', type='secondary', key=f'excluir_pdf_{int(row.id)}'):
-                q('UPDATE trabalhos SET arquivo=?, arquivo_dados=NULL WHERE id=?', ('', int(row.id)))
+            confirmar_pdf = st.checkbox(
+                'Confirmo que desejo excluir somente o PDF anexado deste trabalho',
+                key=f'conf_excluir_pdf_{int(row.id)}'
+            )
+            if confirmar_pdf and st.button(
+                'Excluir PDF anexado',
+                type='secondary',
+                key=f'excluir_pdf_{int(row.id)}'
+            ):
+                q(
+                    'UPDATE trabalhos SET arquivo=?, arquivo_dados=NULL WHERE id=?',
+                    ('', int(row.id))
+                )
                 log(st.session_state.user['email'], f'Excluiu o PDF anexado do trabalho {code}')
                 _set_flash(f'PDF do trabalho {code} excluído com sucesso.')
                 st.rerun()
@@ -928,48 +919,35 @@ def page_trabalhos():
 
 def page_users():
     st.title('Gestão de avaliadores')
-    st.caption('Cadastre, edite, ative ou bloqueie contas de avaliadores. A área do avaliador define em quais áreas de trabalhos ele poderá ser distribuído.')
-
-    st.dataframe(
-        df("""SELECT id,nome,email,area_avaliacao AS area,perfil,tipo_autenticacao AS autenticacao,
-            CASE WHEN ativo=1 THEN 'Ativo' ELSE 'Bloqueado' END AS status
-            FROM users ORDER BY nome"""),
-        width='stretch', hide_index=True
-    )
-
+    st.caption('Cadastre, edite, ative ou bloqueie contas de avaliadores.')
+    st.dataframe(df("SELECT id,nome,email,perfil,tipo_autenticacao AS autenticacao,CASE WHEN ativo=1 THEN 'Ativo' ELSE 'Bloqueado' END AS status FROM users ORDER BY nome"),width='stretch',hide_index=True)
     st.subheader('Importar avaliadores por planilha')
-    st.caption('A planilha deve conter Nome, E-mail e Área. A Área pode ser CS, PG CS, CA, PG CA, CB, PG CB, CH, PG CH, CSA, PG CSA, CET, PG CET, ENG, PG ENG, LLA ou PG LLA.')
+    st.caption('A planilha deve conter Nome e E-mail. A senha inicial é primeiro_nome + avaliador para todas as contas, independentemente do domínio. No primeiro acesso, a troca de senha será obrigatória.')
     arquivo_planilha=st.file_uploader('Planilha de avaliadores (.xlsx ou .csv)',type=['xlsx','csv'],key='planilha_avaliadores')
     if arquivo_planilha is not None and st.button('Importar planilha',type='primary'):
         try:
             imp=pd.read_csv(arquivo_planilha) if arquivo_planilha.name.lower().endswith('.csv') else pd.read_excel(arquivo_planilha)
             imp.columns=[str(c).strip().lower() for c in imp.columns]
             mapa={c.replace('á','a').replace('ã','a').replace('é','e').replace('ê','e').replace('í','i').replace('ó','o').replace('ô','o').replace('ú','u'):c for c in imp.columns}
-            nome_col=mapa.get('nome') or mapa.get('nome completo')
-            email_col=mapa.get('e-mail') or mapa.get('email')
-            area_col=mapa.get('area') or mapa.get('area de atuacao') or mapa.get('area de avaliacao')
-            if not nome_col or not email_col or not area_col:
-                st.error('A planilha precisa conter as colunas Nome, E-mail e Área.')
+            nome_col=mapa.get('nome') or mapa.get('nome completo'); email_col=mapa.get('e-mail') or mapa.get('email')
+            if not nome_col or not email_col: st.error('A planilha precisa conter as colunas Nome e E-mail.')
             else:
                 cred=[]; ok=0; erros=[]
-                aliases_validos={_normalizar_area_texto(a) for aliases in AREAS_AVALIACAO.values() for a in aliases}
                 for _,r in imp.iterrows():
-                    nome=str(r[nome_col]).strip()
-                    email=str(r[email_col]).strip().lower()
-                    area=str(r[area_col]).strip()
+                    nome=str(r[nome_col]).strip(); email=str(r[email_col]).strip().lower()
                     if not nome or not email or email=='nan': continue
-                    if _normalizar_area_texto(area) not in aliases_validos:
-                        erros.append(f'{email}: área inválida ({area})')
-                        continue
+                    # Duplicidade: se o e-mail já estiver cadastrado, não importar novamente.
+                    # A comparação também considera nome + e-mail para tornar a regra explícita.
                     existente=q('SELECT id FROM users WHERE lower(email)=lower(?) OR (lower(trim(nome))=lower(trim(?)) AND lower(email)=lower(?))',(email,nome,email))
                     if existente:
                         continue
                     primeiro=_senha_inicial_nome(nome)
                     senha_inicial=primeiro+'avaliador'
                     try:
-                        q('INSERT INTO users(nome,email,perfil,senha,ativo,tipo_autenticacao,deve_trocar_senha,area_avaliacao) VALUES(?,?,?,?,1,\'local\',1,?)',(nome,email,'avaliador',pw(senha_inicial),area))
-                        cred.append({'Nome':nome,'E-mail':email,'Área':area,'Senha inicial':senha_inicial}); ok+=1
+                        q('INSERT INTO users(nome,email,perfil,senha,ativo,tipo_autenticacao,deve_trocar_senha) VALUES(?,?,?,?,1,\'local\',1)',(nome,email,'avaliador',pw(senha_inicial)))
+                        cred.append({'Nome':nome,'E-mail':email,'Senha inicial':senha_inicial}); ok+=1
                     except psycopg.IntegrityError:
+                        # Outra linha da própria planilha ou outra sessão pode ter criado a conta.
                         continue
                     except Exception as e: erros.append(f'{email}: {e}')
                 if cred:
@@ -978,26 +956,21 @@ def page_users():
                     st.download_button('Baixar credenciais iniciais (CSV)',pd.DataFrame(cred).to_csv(index=False).encode('utf-8-sig'),'credenciais_avaliadores.csv','text/csv')
                 if erros: st.warning('Contas não criadas: ' + ' | '.join(erros[:10]))
         except Exception as e: st.error(f'Não foi possível importar a planilha: {e}')
-
     st.subheader('Cadastrar avaliador')
     st.session_state.setdefault('novo_user_form_version',0); v=st.session_state.novo_user_form_version
     with st.form(f'novo_user_{v}'):
-        nome=st.text_input('Nome completo',key=f'nome_{v}')
-        email=st.text_input('E-mail',key=f'email_{v}')
-        area_opts=[a for g in AREAS_AVALIACAO.values() for a in sorted(g)]
-        area_avaliacao=st.selectbox('Área do avaliador',area_opts,key=f'area_{v}')
+        nome=st.text_input('Nome completo',key=f'nome_{v}'); email=st.text_input('E-mail',key=f'email_{v}')
         senha=st.text_input('Senha inicial',type='password',key=f'senha_{v}')
         submit=st.form_submit_button('Cadastrar avaliador')
     if submit:
-        if not nome.strip() or not email.strip() or not senha: st.error('Nome, e-mail, área e senha inicial são obrigatórios.')
+        if not nome.strip() or not email.strip() or not senha: st.error('Nome, e-mail e senha inicial são obrigatórios.')
         elif len(senha)<6: st.error('A senha deve possuir pelo menos 6 caracteres.')
         else:
             try:
-                q('INSERT INTO users(nome,email,perfil,senha,ativo,tipo_autenticacao,deve_trocar_senha,area_avaliacao) VALUES(?,?,?,?,1,\'local\',1,?)',(nome.strip(),email.strip().lower(),'avaliador',pw(senha),area_avaliacao))
-                log(st.session_state.user['email'],f'Cadastrou avaliador {email.strip().lower()} - área {area_avaliacao}'); st.success('Avaliador cadastrado.'); st.session_state.novo_user_form_version+=1; st.rerun()
+                q('INSERT INTO users(nome,email,perfil,senha,ativo,tipo_autenticacao,deve_trocar_senha) VALUES(?,?,?,?,1,\'local\',1)',(nome.strip(),email.strip().lower(),'avaliador',pw(senha)))
+                log(st.session_state.user['email'],f'Cadastrou avaliador {email.strip().lower()}'); st.success('Avaliador cadastrado.'); st.session_state.novo_user_form_version+=1; st.rerun()
             except Exception as e: st.error(f'Não foi possível cadastrar: {e}')
-
-    usuarios=df("SELECT id,nome,email,ativo,area_avaliacao FROM users WHERE perfil='avaliador' ORDER BY nome")
+    usuarios=df("SELECT id,nome,email,ativo FROM users WHERE perfil='avaliador' ORDER BY nome")
     st.subheader('Administrar conta')
     escolha=st.selectbox('Selecione o avaliador',['Nenhum']+[f"{r.nome} - {r.email}" for _,r in usuarios.iterrows()])
     if escolha!='Nenhum':
@@ -1006,23 +979,19 @@ def page_users():
         with st.form(f'editar_user_{uid}'):
             novo_nome=st.text_input('Nome',value=u.nome)
             novo_email=st.text_input('E-mail',value=u.email)
-            area_opts=[a for g in AREAS_AVALIACAO.values() for a in sorted(g)]
-            area_atual=str(u.area_avaliacao or '').strip()
-            idx_area=area_opts.index(area_atual) if area_atual in area_opts else 0
-            nova_area=st.selectbox('Área do avaliador',area_opts,index=idx_area)
             nova_senha=st.text_input('Nova senha (opcional)',type='password')
             ativo=st.checkbox('Conta ativa',value=bool(u.ativo))
             salvar=st.form_submit_button('Salvar alterações')
         if salvar:
-            if not novo_nome.strip() or not novo_email.strip(): st.error('Nome, e-mail e área são obrigatórios.')
+            if not novo_nome.strip() or not novo_email.strip(): st.error('Nome e e-mail são obrigatórios.')
             elif nova_senha and len(nova_senha)<6: st.error('A nova senha deve possuir pelo menos 6 caracteres.')
             else:
                 try:
                     if nova_senha:
-                        q('UPDATE users SET nome=?,email=?,senha=?,ativo=?,area_avaliacao=?,deve_trocar_senha=1 WHERE id=?',(novo_nome.strip(),novo_email.strip().lower(),pw(nova_senha),int(ativo),nova_area,uid))
+                        q('UPDATE users SET nome=?,email=?,senha=?,ativo=?,deve_trocar_senha=1 WHERE id=?',(novo_nome.strip(),novo_email.strip().lower(),pw(nova_senha),int(ativo),uid))
                     else:
-                        q('UPDATE users SET nome=?,email=?,ativo=?,area_avaliacao=? WHERE id=?',(novo_nome.strip(),novo_email.strip().lower(),int(ativo),nova_area,uid))
-                    log(st.session_state.user['email'],f'Alterou conta do avaliador {uid} - área {nova_area}'); st.success('Conta atualizada.'); st.rerun()
+                        q('UPDATE users SET nome=?,email=?,ativo=? WHERE id=?',(novo_nome.strip(),novo_email.strip().lower(),int(ativo),uid))
+                    log(st.session_state.user['email'],f'Alterou conta do avaliador {uid}'); st.success('Conta atualizada.'); st.rerun()
                 except Exception as e: st.error(f'Não foi possível atualizar: {e}')
 
     st.subheader('Excluir avaliador')
@@ -1040,7 +1009,7 @@ def page_users():
                 st.success('Avaliador excluído com sucesso.')
                 st.rerun()
             except Exception as e:
-                st.error(f'Não foi possível excluir: {e}')
+                st.error(f'Não foi possível excluir o avaliador: {e}')
 
     avaliadores=df("SELECT id,nome,email FROM users WHERE perfil='avaliador' ORDER BY nome")
     if not avaliadores.empty:
@@ -1059,249 +1028,45 @@ def page_users():
 
 def page_distribution():
     st.title('Distribuição dos trabalhos')
-
-    # Trabalhos disponíveis para distribuição.
-    t = df('SELECT id,codigo,area,titulo,arquivo FROM trabalhos')
-    u = df("SELECT id,nome,email,area_avaliacao FROM users WHERE perfil='avaliador' AND ativo=1 ORDER BY nome")
-
+    t=df('SELECT id,codigo,area,titulo FROM trabalhos')
+    u=df("SELECT id,nome,email FROM users WHERE perfil='avaliador' AND ativo=1 ORDER BY nome")
     if t.empty or u.empty:
-        st.info('Cadastre trabalhos e avaliadores primeiro.')
-        return
-
-    # Filtro por área para facilitar a localização dos trabalhos.
-    areas = sorted(
-        [a for a in t['area'].dropna().unique().tolist() if str(a).strip()],
-        key=lambda x: str(x).lower()
-    )
-    filtro_area = st.selectbox(
-        'Filtrar por área',
-        ['Todas as áreas'] + areas,
-        key='distribuicao_area'
-    )
-
-    if filtro_area != 'Todas as áreas':
-        t = t[t.area == filtro_area].copy()
-
-    if t.empty:
-        st.info('Nenhum trabalho encontrado para a área selecionada.')
-        return
-
-    ordem = st.selectbox(
-        'Ordenar trabalhos por código',
-        ['Crescente numérica', 'Alfabética'],
-        key='distribuicao_ordem'
-    )
-    t = _sort_codes(t) if ordem == 'Crescente numérica' else t.sort_values(
-        'codigo', key=lambda x: x.astype(str).str.lower(), kind='stable'
-    )
-
-    # Nome do arquivo para exibição. Quando o campo estiver vazio,
-    # usa o nome padrão que a plataforma adota para o PDF.
-    t['Nome do arquivo'] = t.apply(
-        lambda r: Path(str(r['arquivo'])).name
-        if str(r.get('arquivo', '')).strip()
-        else f"{r['codigo']}.pdf",
-        axis=1
-    )
-
-    st.markdown('### Trabalhos disponíveis')
-    st.dataframe(
-        t[['codigo', 'area', 'Nome do arquivo', 'titulo']].rename(columns={
-            'codigo': 'Código',
-            'area': 'Área',
-            'titulo': 'Título'
-        }),
-        width='stretch',
-        hide_index=True
-    )
-
-    # Seleção pelo código + nome do arquivo, facilitando a identificação.
-    opcoes = {
-        f"{r.codigo} — {r['Nome do arquivo']}": r.codigo
-        for _, r in t.iterrows()
-    }
-    escolha = st.selectbox('Selecione o trabalho', list(opcoes.keys()))
-    code = opcoes[escolha]
-    tr = t[t.codigo == code].iloc[0]
-
-    # Depois que o trabalho é selecionado, restringe os avaliadores ao mesmo
-    # grupo de área do trabalho. CS/PG CS, por exemplo, pertencem ao mesmo grupo.
-    u_area = _avaliadores_compativeis_com_area(u, tr.area)
-    if u_area.empty:
-        st.warning(
-            f'Não há avaliadores ativos cadastrados para a área de {tr.area}. '
-            'Cadastre/ajuste a área dos avaliadores em Gestão de avaliadores.'
-        )
-        return
-    u = u_area
-
-    st.caption(
-        f"Área: {tr.area} · Código: {tr.codigo} · Nome do arquivo: {tr['Nome do arquivo']}"
-    )
-
-    current = df(
-        "SELECT id,avaliador_id,tipo FROM atribuicoes "
-        "WHERE trabalho_id=? AND tipo IN ('principal','principal2')",
-        (int(tr.id),)
-    )
-    ev = df(
-        "SELECT avaliador_id,tipo FROM avaliacoes "
-        "WHERE trabalho_id=? AND tipo IN ('principal','principal2')",
-        (int(tr.id),)
-    )
-    assigned_map = {str(r.tipo): int(r.avaliador_id) for _, r in current.iterrows()}
-    evaluated_types = set(str(r.tipo) for _, r in ev.iterrows())
-
-    uopts = {f"{r.nome} - {r.email}": int(r.id) for _, r in u.iterrows()}
-    opts1 = list(uopts.keys())
-    cur1 = assigned_map.get('principal')
-    idx1 = list(uopts.values()).index(cur1) if cur1 in uopts.values() else 0
-    lock1 = 'principal' in evaluated_types
-    one = st.selectbox(
-        'Avaliador 1',
-        opts1,
-        index=idx1,
-        disabled=lock1,
-        help='Um avaliador que já enviou a avaliação não pode ser substituído.'
-    )
-
-    opts2 = {'- Não atribuído -': None, **uopts}
-    cur2 = assigned_map.get('principal2')
-    idx2 = list(opts2.values()).index(cur2) if cur2 in opts2.values() else 0
-    lock2 = 'principal2' in evaluated_types
-    two = st.selectbox(
-        'Avaliador 2 (opcional)',
-        list(opts2),
-        index=idx2,
-        disabled=lock2,
-        help='O avaliador pode ser substituído enquanto ainda não tiver enviado a avaliação.'
-    )
-
-    one_id = uopts[one]
-    two_id = opts2[two]
-
-    if two_id is not None and one_id == two_id:
-        st.warning('Escolha avaliadores diferentes.')
-
-    if len(evaluated_types) == 1:
+        st.info('Cadastre trabalhos e avaliadores primeiro.'); return
+    ordem=st.selectbox('Ordenar trabalhos por código',['Crescente numérica','Alfabética'],key='distribuicao_ordem')
+    t=_sort_codes(t) if ordem=='Crescente numérica' else t.sort_values('codigo',key=lambda x:x.astype(str).str.lower(),kind='stable')
+    code=st.selectbox('Trabalho',t.codigo.tolist()); tr=t[t.codigo==code].iloc[0]
+    current=df("SELECT id,avaliador_id,tipo FROM atribuicoes WHERE trabalho_id=? AND tipo IN ('principal','principal2')",(int(tr.id),))
+    ev=df("SELECT avaliador_id,tipo FROM avaliacoes WHERE trabalho_id=? AND tipo IN ('principal','principal2')",(int(tr.id),))
+    assigned_map={str(r.tipo):int(r.avaliador_id) for _,r in current.iterrows()}
+    evaluated_types=set(str(r.tipo) for _,r in ev.iterrows())
+    uopts={f"{r.nome} - {r.email}":int(r.id) for _,r in u.iterrows()}
+    opts1=list(uopts.keys()); cur1=assigned_map.get('principal'); idx1=list(uopts.values()).index(cur1) if cur1 in uopts.values() else 0
+    lock1='principal' in evaluated_types
+    one=st.selectbox('Avaliador 1',opts1,index=idx1,disabled=lock1,help='Um avaliador que já enviou a avaliação não pode ser substituído.')
+    opts2={'- Não atribuído -':None,**uopts}; cur2=assigned_map.get('principal2'); idx2=list(opts2.values()).index(cur2) if cur2 in opts2.values() else 0
+    lock2='principal2' in evaluated_types
+    two=st.selectbox('Avaliador 2 (opcional)',list(opts2),index=idx2,disabled=lock2,help='O avaliador pode ser substituído enquanto ainda não tiver enviado a avaliação.')
+    one_id=uopts[one]; two_id=opts2[two]
+    if two_id is not None and one_id==two_id: st.warning('Escolha avaliadores diferentes.')
+    if len(evaluated_types)==1:
         st.info('Um dos avaliadores já enviou a avaliação. O outro ainda pode ser substituído ou alterado.')
-    elif len(evaluated_types) >= 2:
+    elif len(evaluated_types)>=2:
         st.warning('Os dois avaliadores principais já enviaram suas avaliações. A distribuição está bloqueada.')
     else:
         st.info('Nenhuma avaliação principal foi enviada. A distribuição pode ser alterada.')
-
-    if st.button(
-        'Salvar distribuição',
-        type='primary',
-        disabled=(len(evaluated_types) >= 2 or (two_id is not None and one_id == two_id))
-    ):
+    if st.button('Salvar distribuição',type='primary',disabled=(len(evaluated_types)>=2 or (two_id is not None and one_id==two_id))):
         if not lock1:
-            q("DELETE FROM atribuicoes WHERE trabalho_id=? AND tipo='principal'", (int(tr.id),))
-            q(
-                "INSERT INTO atribuicoes(trabalho_id,avaliador_id,tipo) VALUES(?,?,?)",
-                (int(tr.id), one_id, 'principal')
-            )
+            q("DELETE FROM atribuicoes WHERE trabalho_id=? AND tipo='principal'",(int(tr.id),))
+            q("INSERT INTO atribuicoes(trabalho_id,avaliador_id,tipo) VALUES(?,?,?)",(int(tr.id),one_id,'principal'))
         if not lock2:
-            q("DELETE FROM atribuicoes WHERE trabalho_id=? AND tipo='principal2'", (int(tr.id),))
+            q("DELETE FROM atribuicoes WHERE trabalho_id=? AND tipo='principal2'",(int(tr.id),))
             if two_id is not None:
-                q(
-                    "INSERT INTO atribuicoes(trabalho_id,avaliador_id,tipo) VALUES(?,?,?)",
-                    (int(tr.id), two_id, 'principal2')
-                )
-        log(st.session_state.user['email'], f'Atualizou distribuição do trabalho {code}')
+                q("INSERT INTO atribuicoes(trabalho_id,avaliador_id,tipo) VALUES(?,?,?)",(int(tr.id),two_id,'principal2'))
+        log(st.session_state.user['email'],f'Atualizou distribuição do trabalho {code}')
         st.success('Atribuições atualizadas. Avaliações já enviadas foram preservadas.')
         st.rerun()
-
     st.subheader('Distribuição atual')
-    distribuicoes = df("""SELECT a.id AS atribuicao_id,
-        t.id AS trabalho_id,
-        t.codigo,
-        t.area,
-        t.arquivo,
-        t.titulo,
-        u.nome,
-        u.email,
-        a.tipo,
-        CASE WHEN EXISTS(
-            SELECT 1 FROM avaliacoes x
-            WHERE x.trabalho_id=a.trabalho_id
-              AND x.avaliador_id=a.avaliador_id
-              AND x.tipo=a.tipo
-        ) THEN 'Avaliação enviada' ELSE 'Pendente' END AS status
-        FROM atribuicoes a
-        JOIN trabalhos t ON t.id=a.trabalho_id
-        JOIN users u ON u.id=a.avaliador_id
-        WHERE a.tipo IN ('principal','principal2')
-        ORDER BY t.area,
-                 NULLIF(regexp_replace(t.codigo, '[^0-9]', '', 'g'), '')::INTEGER,
-                 t.codigo,a.tipo""")
-
-    if filtro_area != 'Todas as áreas' and not distribuicoes.empty:
-        distribuicoes = distribuicoes[distribuicoes['area'] == filtro_area].copy()
-
-    if distribuicoes.empty:
-        st.info('Não há distribuições cadastradas para a área selecionada.')
-    else:
-        distribuicoes['Nome do arquivo'] = distribuicoes.apply(
-            lambda r: Path(str(r['arquivo'])).name
-            if str(r.get('arquivo', '')).strip()
-            else f"{r['codigo']}.pdf",
-            axis=1
-        )
-
-        st.dataframe(
-            distribuicoes[['codigo','area','Nome do arquivo','titulo','nome','email','tipo','status']].rename(columns={
-                'codigo':'Código',
-                'area':'Área',
-                'titulo':'Título',
-                'nome':'Avaliador',
-                'email':'E-mail',
-                'tipo':'Tipo',
-                'status':'Status'
-            }),
-            width='stretch',
-            hide_index=True
-        )
-
-        # Exclusão individual da atribuição selecionada.
-        opcoes_exclusao = {
-            f"{r.codigo} — {r['Nome do arquivo']} — {r.nome} ({'Avaliador 1' if r.tipo == 'principal' else 'Avaliador 2'})": int(r.atribuicao_id)
-            for _, r in distribuicoes.iterrows()
-        }
-        escolha_exclusao = st.selectbox(
-            'Selecione a distribuição que deseja excluir',
-            ['-- Selecione --'] + list(opcoes_exclusao.keys()),
-            key='distribuicao_excluir_selecao'
-        )
-
-        if escolha_exclusao != '-- Selecione --':
-            atribuicao_id = opcoes_exclusao[escolha_exclusao]
-            registro = distribuicoes[distribuicoes['atribuicao_id'] == atribuicao_id].iloc[0]
-            tem_avaliacao = str(registro.status) == 'Avaliação enviada'
-
-            if tem_avaliacao:
-                st.warning(
-                    'Esta distribuição não pode ser excluída porque o avaliador já enviou a avaliação. '
-                    'Isso preserva a integridade do julgamento registrado.'
-                )
-            else:
-                confirmar_exclusao = st.checkbox(
-                    'Confirmo que desejo excluir esta distribuição.',
-                    key=f'conf_excluir_distribuicao_{atribuicao_id}'
-                )
-                if confirmar_exclusao and st.button(
-                    'Excluir distribuição selecionada',
-                    type='secondary',
-                    key=f'excluir_distribuicao_{atribuicao_id}'
-                ):
-                    q('DELETE FROM atribuicoes WHERE id=?', (int(atribuicao_id),))
-                    log(
-                        st.session_state.user['email'],
-                        f"Excluiu distribuição do trabalho {registro.codigo} para o avaliador {registro.nome}"
-                    )
-                    st.success('Distribuição excluída com sucesso.')
-                    st.rerun()
-
+    st.dataframe(df("""SELECT t.codigo,t.area,t.titulo,u.nome,u.email,a.tipo,CASE WHEN EXISTS(SELECT 1 FROM avaliacoes x WHERE x.trabalho_id=a.trabalho_id AND x.avaliador_id=a.avaliador_id AND x.tipo=a.tipo) THEN 'Avaliação enviada' ELSE 'Pendente' END AS status FROM atribuicoes a JOIN trabalhos t ON t.id=a.trabalho_id JOIN users u ON u.id=a.avaliador_id ORDER BY t.area,NULLIF(regexp_replace(t.codigo, \'[^0-9]\', \'\', \'g\'), \'\')::INTEGER,t.codigo,a.tipo"""),width='stretch',hide_index=True)
 def assigned(uid):
     d=df('''SELECT t.*,a.tipo FROM atribuicoes a JOIN trabalhos t ON t.id=a.trabalho_id WHERE a.avaliador_id=?''',(uid,))
     return _sort_codes(d) if not d.empty else d
