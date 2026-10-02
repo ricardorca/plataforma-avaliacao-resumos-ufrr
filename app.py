@@ -227,13 +227,6 @@ def _restore_login_from_cookie():
     if not user or not user.get('ativo'):
         _clear_login_cookie()
         return False
-
-    # Avaliadores não possuem login persistente.
-    # Mesmo que exista um cookie antigo, ele é eliminado e o login será solicitado.
-    if user.get('perfil') == 'avaliador':
-        _clear_login_cookie()
-        return False
-
     st.session_state.user = user
     return True
 
@@ -471,16 +464,9 @@ def login():
                     u = get_user(int(u['id']))
                 log(u['email'], 'Login realizado')
                 st.session_state.user = u
-
-                # Somente coordenação e master terão login persistente.
-                # Avaliadores usam apenas a sessão atual do navegador.
-                if u['perfil'] in ('coord', 'master'):
-                    _set_login_cookie(int(u['id']))
-                else:
-                    _clear_login_cookie()
-
-                # Dá tempo para o componente frontend gravar/remover
-                # o cookie antes de recriar a sessão Streamlit.
+                _set_login_cookie(int(u['id']))
+                # Dá tempo para o componente frontend gravar o cookie antes
+                # de recriar a sessão Streamlit.
                 time.sleep(0.5)
                 st.rerun()
             else: st.error('E-mail ou senha inválidos.')
@@ -991,45 +977,166 @@ def page_users():
 
 def page_distribution():
     st.title('Distribuição dos trabalhos')
-    t=df('SELECT id,codigo,area,titulo FROM trabalhos')
-    u=df("SELECT id,nome,email FROM users WHERE perfil='avaliador' AND ativo=1 ORDER BY nome")
+
+    # Trabalhos disponíveis para distribuição.
+    t = df('SELECT id,codigo,area,titulo,arquivo FROM trabalhos')
+    u = df("SELECT id,nome,email FROM users WHERE perfil='avaliador' AND ativo=1 ORDER BY nome")
+
     if t.empty or u.empty:
-        st.info('Cadastre trabalhos e avaliadores primeiro.'); return
-    ordem=st.selectbox('Ordenar trabalhos por código',['Crescente numérica','Alfabética'],key='distribuicao_ordem')
-    t=_sort_codes(t) if ordem=='Crescente numérica' else t.sort_values('codigo',key=lambda x:x.astype(str).str.lower(),kind='stable')
-    code=st.selectbox('Trabalho',t.codigo.tolist()); tr=t[t.codigo==code].iloc[0]
-    current=df("SELECT id,avaliador_id,tipo FROM atribuicoes WHERE trabalho_id=? AND tipo IN ('principal','principal2')",(int(tr.id),))
-    ev=df("SELECT avaliador_id,tipo FROM avaliacoes WHERE trabalho_id=? AND tipo IN ('principal','principal2')",(int(tr.id),))
-    assigned_map={str(r.tipo):int(r.avaliador_id) for _,r in current.iterrows()}
-    evaluated_types=set(str(r.tipo) for _,r in ev.iterrows())
-    uopts={f"{r.nome} - {r.email}":int(r.id) for _,r in u.iterrows()}
-    opts1=list(uopts.keys()); cur1=assigned_map.get('principal'); idx1=list(uopts.values()).index(cur1) if cur1 in uopts.values() else 0
-    lock1='principal' in evaluated_types
-    one=st.selectbox('Avaliador 1',opts1,index=idx1,disabled=lock1,help='Um avaliador que já enviou a avaliação não pode ser substituído.')
-    opts2={'- Não atribuído -':None,**uopts}; cur2=assigned_map.get('principal2'); idx2=list(opts2.values()).index(cur2) if cur2 in opts2.values() else 0
-    lock2='principal2' in evaluated_types
-    two=st.selectbox('Avaliador 2 (opcional)',list(opts2),index=idx2,disabled=lock2,help='O avaliador pode ser substituído enquanto ainda não tiver enviado a avaliação.')
-    one_id=uopts[one]; two_id=opts2[two]
-    if two_id is not None and one_id==two_id: st.warning('Escolha avaliadores diferentes.')
-    if len(evaluated_types)==1:
+        st.info('Cadastre trabalhos e avaliadores primeiro.')
+        return
+
+    # Filtro por área para facilitar a localização dos trabalhos.
+    areas = sorted(
+        [a for a in t['area'].dropna().unique().tolist() if str(a).strip()],
+        key=lambda x: str(x).lower()
+    )
+    filtro_area = st.selectbox(
+        'Filtrar por área',
+        ['Todas as áreas'] + areas,
+        key='distribuicao_area'
+    )
+
+    if filtro_area != 'Todas as áreas':
+        t = t[t.area == filtro_area].copy()
+
+    if t.empty:
+        st.info('Nenhum trabalho encontrado para a área selecionada.')
+        return
+
+    ordem = st.selectbox(
+        'Ordenar trabalhos por código',
+        ['Crescente numérica', 'Alfabética'],
+        key='distribuicao_ordem'
+    )
+    t = _sort_codes(t) if ordem == 'Crescente numérica' else t.sort_values(
+        'codigo', key=lambda x: x.astype(str).str.lower(), kind='stable'
+    )
+
+    # Nome do arquivo para exibição. Quando o campo estiver vazio,
+    # usa o nome padrão que a plataforma adota para o PDF.
+    t['Nome do arquivo'] = t.apply(
+        lambda r: Path(str(r['arquivo'])).name
+        if str(r.get('arquivo', '')).strip()
+        else f"{r['codigo']}.pdf",
+        axis=1
+    )
+
+    st.markdown('### Trabalhos disponíveis')
+    st.dataframe(
+        t[['codigo', 'area', 'Nome do arquivo', 'titulo']].rename(columns={
+            'codigo': 'Código',
+            'area': 'Área',
+            'titulo': 'Título'
+        }),
+        width='stretch',
+        hide_index=True
+    )
+
+    # Seleção pelo código + nome do arquivo, facilitando a identificação.
+    opcoes = {
+        f"{r.codigo} — {r['Nome do arquivo']}": r.codigo
+        for _, r in t.iterrows()
+    }
+    escolha = st.selectbox('Selecione o trabalho', list(opcoes.keys()))
+    code = opcoes[escolha]
+    tr = t[t.codigo == code].iloc[0]
+
+    st.caption(
+        f"Área: {tr.area} · Código: {tr.codigo} · Nome do arquivo: {tr['Nome do arquivo']}"
+    )
+
+    current = df(
+        "SELECT id,avaliador_id,tipo FROM atribuicoes "
+        "WHERE trabalho_id=? AND tipo IN ('principal','principal2')",
+        (int(tr.id),)
+    )
+    ev = df(
+        "SELECT avaliador_id,tipo FROM avaliacoes "
+        "WHERE trabalho_id=? AND tipo IN ('principal','principal2')",
+        (int(tr.id),)
+    )
+    assigned_map = {str(r.tipo): int(r.avaliador_id) for _, r in current.iterrows()}
+    evaluated_types = set(str(r.tipo) for _, r in ev.iterrows())
+
+    uopts = {f"{r.nome} - {r.email}": int(r.id) for _, r in u.iterrows()}
+    opts1 = list(uopts.keys())
+    cur1 = assigned_map.get('principal')
+    idx1 = list(uopts.values()).index(cur1) if cur1 in uopts.values() else 0
+    lock1 = 'principal' in evaluated_types
+    one = st.selectbox(
+        'Avaliador 1',
+        opts1,
+        index=idx1,
+        disabled=lock1,
+        help='Um avaliador que já enviou a avaliação não pode ser substituído.'
+    )
+
+    opts2 = {'- Não atribuído -': None, **uopts}
+    cur2 = assigned_map.get('principal2')
+    idx2 = list(opts2.values()).index(cur2) if cur2 in opts2.values() else 0
+    lock2 = 'principal2' in evaluated_types
+    two = st.selectbox(
+        'Avaliador 2 (opcional)',
+        list(opts2),
+        index=idx2,
+        disabled=lock2,
+        help='O avaliador pode ser substituído enquanto ainda não tiver enviado a avaliação.'
+    )
+
+    one_id = uopts[one]
+    two_id = opts2[two]
+
+    if two_id is not None and one_id == two_id:
+        st.warning('Escolha avaliadores diferentes.')
+
+    if len(evaluated_types) == 1:
         st.info('Um dos avaliadores já enviou a avaliação. O outro ainda pode ser substituído ou alterado.')
-    elif len(evaluated_types)>=2:
+    elif len(evaluated_types) >= 2:
         st.warning('Os dois avaliadores principais já enviaram suas avaliações. A distribuição está bloqueada.')
     else:
         st.info('Nenhuma avaliação principal foi enviada. A distribuição pode ser alterada.')
-    if st.button('Salvar distribuição',type='primary',disabled=(len(evaluated_types)>=2 or (two_id is not None and one_id==two_id))):
+
+    if st.button(
+        'Salvar distribuição',
+        type='primary',
+        disabled=(len(evaluated_types) >= 2 or (two_id is not None and one_id == two_id))
+    ):
         if not lock1:
-            q("DELETE FROM atribuicoes WHERE trabalho_id=? AND tipo='principal'",(int(tr.id),))
-            q("INSERT INTO atribuicoes(trabalho_id,avaliador_id,tipo) VALUES(?,?,?)",(int(tr.id),one_id,'principal'))
+            q("DELETE FROM atribuicoes WHERE trabalho_id=? AND tipo='principal'", (int(tr.id),))
+            q(
+                "INSERT INTO atribuicoes(trabalho_id,avaliador_id,tipo) VALUES(?,?,?)",
+                (int(tr.id), one_id, 'principal')
+            )
         if not lock2:
-            q("DELETE FROM atribuicoes WHERE trabalho_id=? AND tipo='principal2'",(int(tr.id),))
+            q("DELETE FROM atribuicoes WHERE trabalho_id=? AND tipo='principal2'", (int(tr.id),))
             if two_id is not None:
-                q("INSERT INTO atribuicoes(trabalho_id,avaliador_id,tipo) VALUES(?,?,?)",(int(tr.id),two_id,'principal2'))
-        log(st.session_state.user['email'],f'Atualizou distribuição do trabalho {code}')
+                q(
+                    "INSERT INTO atribuicoes(trabalho_id,avaliador_id,tipo) VALUES(?,?,?)",
+                    (int(tr.id), two_id, 'principal2')
+                )
+        log(st.session_state.user['email'], f'Atualizou distribuição do trabalho {code}')
         st.success('Atribuições atualizadas. Avaliações já enviadas foram preservadas.')
         st.rerun()
+
     st.subheader('Distribuição atual')
-    st.dataframe(df("""SELECT t.codigo,t.area,t.titulo,u.nome,u.email,a.tipo,CASE WHEN EXISTS(SELECT 1 FROM avaliacoes x WHERE x.trabalho_id=a.trabalho_id AND x.avaliador_id=a.avaliador_id AND x.tipo=a.tipo) THEN 'Avaliação enviada' ELSE 'Pendente' END AS status FROM atribuicoes a JOIN trabalhos t ON t.id=a.trabalho_id JOIN users u ON u.id=a.avaliador_id ORDER BY t.area,NULLIF(regexp_replace(t.codigo, \'[^0-9]\', \'\', \'g\'), \'\')::INTEGER,t.codigo,a.tipo"""),width='stretch',hide_index=True)
+    st.dataframe(
+        df("""SELECT t.codigo,t.area,t.arquivo,t.titulo,u.nome,u.email,a.tipo,
+        CASE WHEN EXISTS(
+            SELECT 1 FROM avaliacoes x
+            WHERE x.trabalho_id=a.trabalho_id
+              AND x.avaliador_id=a.avaliador_id
+              AND x.tipo=a.tipo
+        ) THEN 'Avaliação enviada' ELSE 'Pendente' END AS status
+        FROM atribuicoes a
+        JOIN trabalhos t ON t.id=a.trabalho_id
+        JOIN users u ON u.id=a.avaliador_id
+        ORDER BY t.area,
+                 NULLIF(regexp_replace(t.codigo, '[^0-9]', '', 'g'), '')::INTEGER,
+                 t.codigo,a.tipo"""),
+        width='stretch',
+        hide_index=True
+    )
 def assigned(uid):
     d=df('''SELECT t.*,a.tipo FROM atribuicoes a JOIN trabalhos t ON t.id=a.trabalho_id WHERE a.avaliador_id=?''',(uid,))
     return _sort_codes(d) if not d.empty else d
