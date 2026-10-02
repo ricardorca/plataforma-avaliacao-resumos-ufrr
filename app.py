@@ -913,15 +913,51 @@ def page_trabalhos():
     qtd_av=int(df('SELECT COUNT(*) n FROM avaliacoes WHERE trabalho_id=?',(int(row.id),)).iloc[0,0])
     if qtd_av: st.warning('Este trabalho já possui avaliações. Alterações de conteúdo ficam bloqueadas para preservar a integridade do julgamento.')
     with st.expander('Modificar trabalho',expanded=True):
-        area=st.text_input('Área',row.area); titulo=st.text_input('Título',row.titulo); nomes=st.text_input('Nomes dos autores',row.nomes); resumo=st.text_area('Resumo',row.resumo,height=180); arq=st.text_input('Nome do arquivo',row.arquivo)
-        pdf_up=st.file_uploader('Enviar/substituir PDF',type=['pdf'],key=f'pdf_{int(row.id)}')
-        if pdf_up is not None: arq=f'{_safe_filename(code)}.pdf'
-        if st.button('Salvar alterações',type='primary') and qtd_av==0:
-            if pdf_up is not None:
-                q('UPDATE trabalhos SET area=?,titulo=?,nomes=?,resumo=?,arquivo=?,arquivo_dados=? WHERE codigo=?',(area,titulo,nomes,resumo,arq,pdf_up.getvalue(),code))
-            else:
-                q('UPDATE trabalhos SET area=?,titulo=?,nomes=?,resumo=?,arquivo=? WHERE codigo=?',(area,titulo,nomes,resumo,arq,code))
-            log(st.session_state.user['email'],f'Editou trabalho {code}'); _set_flash(f'Trabalho {code} atualizado com sucesso.'); st.rerun()
+        area=st.text_input('Área',row.area)
+        titulo=st.text_input('Título',row.titulo)
+        nomes=st.text_input('Nomes dos autores',row.nomes)
+        resumo=st.text_area('Resumo',row.resumo,height=180)
+        arq=st.text_input('Nome do arquivo',row.arquivo)
+
+        # Alterações no conteúdo do trabalho permanecem separadas do gerenciamento
+        # do PDF. Isso permite anexar/salvar um PDF mesmo quando o trabalho já
+        # possui avaliações, sem alterar o julgamento realizado.
+        if st.button('Salvar alterações',type='primary',key=f'salvar_trabalho_{int(row.id)}') and qtd_av==0:
+            q(
+                'UPDATE trabalhos SET area=?,titulo=?,nomes=?,resumo=?,arquivo=? WHERE codigo=?',
+                (area,titulo,nomes,resumo,arq,code)
+            )
+            log(st.session_state.user['email'],f'Editou trabalho {code}')
+            _set_flash(f'Trabalho {code} atualizado com sucesso.')
+            st.rerun()
+
+    # -------------------------------------------------------------------------
+    # Anexar/substituir o PDF separadamente
+    # -------------------------------------------------------------------------
+    st.subheader('PDF do trabalho')
+    st.caption('O PDF é salvo separadamente das alterações de conteúdo. O botão abaixo grava o arquivo diretamente no banco de dados.')
+    pdf_up=st.file_uploader(
+        'Enviar/substituir PDF',
+        type=['pdf'],
+        key=f'pdf_upload_{int(row.id)}'
+    )
+    if pdf_up is not None:
+        if st.button('Salvar PDF anexado',type='primary',key=f'salvar_pdf_{int(row.id)}'):
+            try:
+                pdf_data=pdf_up.getvalue()
+                if not pdf_data:
+                    st.error('O arquivo PDF está vazio.')
+                else:
+                    nome_pdf=f'{_safe_filename(code)}.pdf'
+                    q(
+                        'UPDATE trabalhos SET arquivo=?, arquivo_dados=? WHERE id=?',
+                        (nome_pdf,pdf_data,int(row.id))
+                    )
+                    log(st.session_state.user['email'],f'Anexou/substituiu o PDF do trabalho {code}')
+                    _set_flash(f'PDF do trabalho {code} salvo com sucesso.')
+                    st.rerun()
+            except Exception as e:
+                st.error(f'Não foi possível salvar o PDF: {e}')
 
     # -------------------------------------------------------------------------
     # Gerenciamento do PDF anexado ao trabalho
